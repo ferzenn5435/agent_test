@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+
+# Logs and runtime files
+logs/*.log
+logs/**/*.log
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Local databases and caches
+*.sqlite
+*.sqlite3
+*.db
+.cache/
+.tmp/
+tmp/
+temp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs and editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# AI assistants: personal local state
+.claude/
+CLAUDE.local.md
+.codex/
+.opencode/
+.sisyphus/
+.cursor/
+.windsurf/
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache*/
+.aider.repo.map
+.continue/
+.tabnine/
+.copilot/
+.gemini/
+gemini.local.md
