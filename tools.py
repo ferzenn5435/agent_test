@@ -73,17 +73,17 @@ class RepositoryTools:
             ),
             "read_file": ToolSpec(
                 name="read_file",
-                description='读取 repo 内 UTF-8 文本文件，最大 20KB，参数: {"path": "相对路径"}',
+                description='读取 repo 内 UTF-8 文本文件并返回带行号内容，最大 20KB，参数: {"path": "相对路径"}',
                 function=self.read_file,
             ),
             "search_text": ToolSpec(
                 name="search_text",
-                description='在 repo 内搜索文本关键字，参数: {"keyword": "关键字"}',
+                description='在 repo 内搜索文本关键字，返回文件名、行号和带行号上下文，参数: {"keyword": "关键字"}',
                 function=self.search_text,
             ),
             "finish": ToolSpec(
                 name="finish",
-                description='完成任务并输出最终答案，参数: {"answer": "最终答案"}',
+                description='完成任务并输出最终答案，尽量引用文件名、函数名和行号，参数: {"answer": "最终答案"}',
                 function=self.finish,
             ),
         }
@@ -126,7 +126,7 @@ class RepositoryTools:
             path: repo 内文件路径。
 
         Returns:
-            文件文本内容。
+            带行号的文件文本内容。
         """
 
         target_file = self._resolve_repo_path(path)
@@ -140,25 +140,27 @@ class RepositoryTools:
         self._validate_readable_file(target_file)
 
         try:
-            return target_file.read_text(encoding="utf-8")
+            file_text = target_file.read_text(encoding="utf-8")
         except UnicodeDecodeError as error:
             raise ToolError(f"文件不是有效的 UTF-8 文本: {path}") from error
 
-    def search_text(self, keyword: str) -> list[dict[str, object]]:
+        return "\n".join(self._format_numbered_lines(file_text.splitlines(), start_line=1))
+
+    def search_text(self, keyword: str) -> list[str]:
         """在 repo 内搜索关键字。
 
         Args:
             keyword: 要搜索的关键字。
 
         Returns:
-            命中列表，包含文件名、行号和附近代码片段。
+            命中列表，包含文件名、行号和附近带行号代码片段。
         """
 
         normalized_keyword = keyword.strip()
         if not normalized_keyword:
             raise ToolError("keyword 不能为空")
 
-        matches: list[dict[str, object]] = []
+        matches: list[str] = []
         for file_path in self._iter_searchable_files():
             lines = self._read_text_lines(file_path)
             if lines is None:
@@ -170,19 +172,18 @@ class RepositoryTools:
 
                 snippet_start = max(line_number - 2, 1)
                 snippet_end = min(line_number + 2, len(lines))
-                snippet = [
-                    {
-                        "line": current_line_number,
-                        "text": lines[current_line_number - 1],
-                    }
-                    for current_line_number in range(snippet_start, snippet_end + 1)
-                ]
+                snippet_lines = lines[snippet_start - 1:snippet_end]
+                formatted_snippet = self._format_numbered_lines(
+                    snippet_lines,
+                    start_line=snippet_start,
+                )
                 matches.append(
-                    {
-                        "file": self._format_repo_path(file_path),
-                        "line": line_number,
-                        "snippet": snippet,
-                    }
+                    "\n".join(
+                        [
+                            f"{self._format_repo_path(file_path)}:{line_number}",
+                            *formatted_snippet,
+                        ]
+                    )
                 )
 
         return matches
@@ -297,6 +298,12 @@ class RepositoryTools:
             return file_path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             return None
+
+    def _format_numbered_lines(self, lines: list[str], start_line: int) -> list[str]:
+        return [
+            f"{line_number} | {line_text}"
+            for line_number, line_text in enumerate(lines, start=start_line)
+        ]
 
     def _has_hidden_path_part(self, file_path: Path) -> bool:
         relative_parts = file_path.relative_to(self.repo_root).parts

@@ -13,15 +13,27 @@
 ## 工具
 
 - `list_dir(path)`：列出 repo 内目录。
-- `read_file(path)`：读取 repo 内 UTF-8 文本文件，单文件最大 20KB。
-- `search_text(keyword)`：搜索 repo 内文本，跳过二进制文件、隐藏目录、`.git`、`node_modules`、`build`、`dist`。
-- `finish(answer)`：输出最终答案。
+- `read_file(path)`：读取 repo 内 UTF-8 文本文件，单文件最大 20KB，返回内容会带行号，例如 `12 | code here`。
+- `search_text(keyword)`：搜索 repo 内文本，返回文件名、行号和上下文行，跳过二进制文件、隐藏目录、`.git`、`node_modules`、`build`、`dist`。
+- `finish(answer)`：输出最终答案，答案应尽量引用文件名、函数名和行号。
 
 所有路径都会限制在传入的 repo 根目录内部。
 
 ## 配置
 
-LLM 调用封装在 `llm_client.py`，默认使用 OpenAI-compatible Chat Completions 接口。运行前设置环境变量：
+LLM 调用封装在 `llm_client.py`，默认使用 OpenAI-compatible Chat Completions 接口。
+
+推荐复制 `.env.example` 为 `.env`，然后在 `.env` 中填写本地配置：
+
+```env
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=your_api_key
+LLM_MODEL=your_model
+```
+
+`.env` 只保存在本地，已被 `.gitignore` 忽略，不会提交密钥。系统环境变量优先级更高；如果系统环境变量和 `.env` 同时存在，程序会使用系统环境变量。
+
+也可以直接设置系统环境变量：
 
 ```powershell
 $env:LLM_BASE_URL = "https://api.openai.com/v1"
@@ -37,8 +49,16 @@ $env:LLM_BASE_URL = "https://example.com/v1/chat/completions"
 
 ## 运行
 
+位置参数方式：
+
 ```powershell
 python main.py E:\path\to\repo "这个项目的入口文件在哪里？"
+```
+
+`--repo` 参数方式：
+
+```powershell
+python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```
 
 程序会打印最终答案，并在 `logs/` 下保存完整运行日志。
@@ -64,7 +84,7 @@ python main.py E:\path\to\repo "这个项目的入口文件在哪里？"
   "thought": "已经得到足够信息。",
   "tool": "finish",
   "args": {
-    "answer": "最终答案"
+    "answer": "最终答案，例如：入口逻辑在 main.py:25 的 main() 中。"
   }
 }
 ```

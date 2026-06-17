@@ -1,0 +1,14 @@
+[
+  {
+    "question": "agent 主循环在哪里？",
+    "must_contain": ["agent.py", "answer", "MAX_STEPS"]
+  },
+  {
+    "question": "工具调用是如何实现的？",
+    "must_contain": ["tools.py", "run_tool"]
+  },
+  {
+    "question": "路径安全检查在哪里实现？",
+    "must_contain": ["tools.py", "repo"]
+  }
+]

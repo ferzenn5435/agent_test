@@ -17,9 +17,28 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
 
     parser = argparse.ArgumentParser(description="最小本地代码库分析 agent")
-    parser.add_argument("repo_path", help="要分析的本地 repo 路径")
-    parser.add_argument("question", help="用户问题")
-    return parser.parse_args()
+    parser.add_argument("--repo", dest="repo_path", help="要分析的本地 repo 路径")
+    parser.add_argument("arguments", nargs="*", help="位置参数：repo 路径和用户问题")
+    args = parser.parse_args()
+
+    if args.repo_path is None:
+        if len(args.arguments) < 2:
+            parser.error(
+                "缺少参数：请使用 python main.py <repo_path> <question>，"
+                "或 python main.py --repo <repo_path> <question>"
+            )
+        repo_path = args.arguments[0]
+        question_parts = args.arguments[1:]
+    else:
+        if not args.arguments:
+            parser.error(
+                "缺少参数：使用 --repo 时必须提供 question，"
+                "例如 python main.py --repo . \"工具调用是如何实现的？\""
+            )
+        repo_path = args.repo_path
+        question_parts = args.arguments
+
+    return argparse.Namespace(repo_path=repo_path, question=" ".join(question_parts))
 
 
 def main() -> int:
