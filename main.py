@@ -7,19 +7,41 @@ import sys
 from pathlib import Path
 
 from agent import CodeAnalysisAgent
-from config import ConfigError, load_llm_config_from_env
+from config import ConfigError, MAX_STEPS, load_llm_config_from_env
 from llm_client import LlmClient, LlmClientError
 from logger import RunLogger
 from tools import RepositoryTools, ToolError
 
 
-def parse_args() -> argparse.Namespace:
+def _positive_int(raw_value: str) -> int:
+    """解析正整数命令行参数。"""
+
+    try:
+        parsed_value = int(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "max_steps must be a positive integer"
+        ) from error
+
+    if parsed_value <= 0:
+        raise argparse.ArgumentTypeError("max_steps must be a positive integer")
+
+    return parsed_value
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析命令行参数。"""
 
     parser = argparse.ArgumentParser(description="最小本地代码库分析 agent")
     parser.add_argument("--repo", dest="repo_path", help="要分析的本地 repo 路径")
+    parser.add_argument(
+        "--max-steps",
+        type=_positive_int,
+        default=MAX_STEPS,
+        help=f"最大工具调用步数 (默认: {MAX_STEPS})",
+    )
     parser.add_argument("arguments", nargs="*", help="位置参数：repo 路径和用户问题")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.repo_path is None:
         if len(args.arguments) < 2:
@@ -38,7 +60,11 @@ def parse_args() -> argparse.Namespace:
         repo_path = args.repo_path
         question_parts = args.arguments
 
-    return argparse.Namespace(repo_path=repo_path, question=" ".join(question_parts))
+    return argparse.Namespace(
+        repo_path=repo_path,
+        question=" ".join(question_parts),
+        max_steps=args.max_steps,
+    )
 
 
 def main() -> int:
@@ -61,6 +87,7 @@ def main() -> int:
             llm_client=llm_client,
             repository_tools=repository_tools,
             run_logger=run_logger,
+            max_steps=args.max_steps,
         )
         final_answer = agent.answer(question)
     except (ConfigError, LlmClientError, ToolError, OSError) as error:

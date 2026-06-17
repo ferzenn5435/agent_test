@@ -25,8 +25,6 @@ ENV/
 
 # Environment and secrets
 .env
-.env
-!.env
 *.pem
 *.key
 *.crt
@@ -35,6 +33,7 @@ ENV/
 secrets/
 
 # Logs and runtime files
+logs/
 logs/*.log
 logs/**/*.log
 *.log

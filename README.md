@@ -1,11 +1,11 @@
 # 最小本地代码库分析 Agent
 
-一个纯 Python 实现的本地代码库分析 agent。它通过命令行接收 repo 路径和用户问题，使用 LLM + 只读工具调用循环分析代码库。
+一个纯 Python 实现的本地代码库分析 agent。它通过命令行接收 repo 路径和用户问题，使用 LLM + 安全工具调用循环分析代码库，并可生成不写入文件的补丁提案。
 
 ## 功能
 
 - 不使用 LangChain、LangGraph、LlamaIndex 等 agent 框架。
-- 只提供只读工具，不写文件，不执行 shell 命令。
+- 只提供安全工具，不写文件，不执行 shell 命令。
 - 每一步要求模型输出严格 JSON。
 - 最大循环步数为 8。
 - 每次运行写入 `logs/run_YYYYMMDD_HHMMSS.json`。
@@ -15,9 +15,10 @@
 - `list_dir(path)`：列出 repo 内目录。
 - `read_file(path)`：读取 repo 内 UTF-8 文本文件，单文件最大 20KB，返回内容会带行号，例如 `12 | code here`。
 - `search_text(keyword)`：搜索 repo 内文本，返回文件名、行号和上下文行，跳过二进制文件、隐藏目录、`.git`、`node_modules`、`build`、`dist`。
+- `propose_patch(file_path, plan, replacements)`：为 repo 内单个文件生成补丁提案和 unified diff，不修改文件。参数包含 `file_path`、`plan`、`replacements`，其中 `replacements` 的每一项包含 `old_text` 和 `new_text`。
 - `finish(answer)`：输出最终答案，答案应尽量引用文件名、函数名和行号。
 
-所有路径都会限制在传入的 repo 根目录内部。
+所有路径都会限制在传入的 repo 根目录内部。`propose_patch` 只返回建议的修改计划和 unified diff，是否在本 agent 外部应用该 diff，由用户自行决定。
 
 ## 配置
 
@@ -76,6 +77,27 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
   }
 }
 ```
+
+需要提出补丁时调用：
+
+```json
+{
+  "thought": "已经确认目标文本，生成补丁提案供用户审查。",
+  "tool": "propose_patch",
+  "args": {
+    "file_path": "prompts.py",
+    "plan": "说明本次修改计划。",
+    "replacements": [
+      {
+        "old_text": "原文本",
+        "new_text": "新文本"
+      }
+    ]
+  }
+}
+```
+
+`propose_patch` 只提出 unified diff，不写入文件。最终答案应包含生成的修改计划和 unified diff，供用户审查后在本 agent 外部决定是否应用。
 
 完成时调用：
 

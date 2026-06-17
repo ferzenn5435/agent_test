@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 from collections.abc import Callable
@@ -80,6 +81,16 @@ class RepositoryTools:
                 name="search_text",
                 description='在 repo 内搜索文本关键字，返回文件名、行号和带行号上下文，参数: {"keyword": "关键字"}',
                 function=self.search_text,
+            ),
+            "propose_patch": ToolSpec(
+                name="propose_patch",
+                description=(
+                    '提出单文件补丁计划但不写入文件，参数: {"file_path": "相对路径", '
+                    '"plan": "修改计划", "replacements": [{"old_text": "原文本", '
+                    '"new_text": "新文本"}]}，返回: {"ok": bool, "file_path": str, '
+                    '"plan": str, "diff": str, "errors": list[str]}'
+                ),
+                function=self.propose_patch,
             ),
             "finish": ToolSpec(
                 name="finish",
@@ -188,6 +199,134 @@ class RepositoryTools:
 
         return matches
 
+    def propose_patch(
+        self,
+        file_path: str,
+        plan: str,
+        replacements: list[dict[str, str]],
+    ) -> dict[str, object]:
+        """提出单文件补丁合同，不写入文件。
+
+        Args:
+            file_path: repo 内单个目标文件路径。
+            plan: 补丁计划说明。
+            replacements: 替换列表，每项包含 old_text 和 new_text。
+
+        Returns:
+            合同固定为 {"ok": bool, "file_path": str, "plan": str, "diff": str, "errors": list[str]}。
+        """
+
+        errors = self._validate_patch_contract(file_path, plan, replacements)
+        response_file_path = file_path if isinstance(file_path, str) else ""
+        response_plan = plan if isinstance(plan, str) else ""
+        if errors:
+            return {
+                "ok": False,
+                "file_path": response_file_path,
+                "plan": response_plan,
+                "diff": "",
+                "errors": errors,
+            }
+
+        try:
+            target_file = self._resolve_repo_path(file_path)
+            self._validate_readable_file(target_file)
+            before_text = target_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return {
+                "ok": False,
+                "file_path": response_file_path,
+                "plan": response_plan,
+                "diff": "",
+                "errors": [f"文件不是有效的 UTF-8 文本: {file_path}"],
+            }
+        except ToolError as error:
+            return {
+                "ok": False,
+                "file_path": response_file_path,
+                "plan": response_plan,
+                "diff": "",
+                "errors": [str(error)],
+            }
+
+        replacement_spans: list[tuple[int, int, str]] = []
+        seen_spans: set[tuple[int, int]] = set()
+        for replacement_index, replacement in enumerate(replacements, start=1):
+            old_text = replacement["old_text"]
+            new_text = replacement["new_text"]
+            if old_text == new_text:
+                errors.append(f"replacements[{replacement_index}] produces no change")
+                continue
+
+            match_count = before_text.count(old_text)
+            if match_count == 0:
+                errors.append(f"replacements[{replacement_index}].old_text not found")
+                continue
+            if match_count > 1:
+                errors.append(f"replacements[{replacement_index}].old_text matched multiple locations")
+                continue
+
+            span_start = before_text.index(old_text)
+            span_end = span_start + len(old_text)
+            span_key = (span_start, span_end)
+            if span_key in seen_spans:
+                errors.append(f"replacements[{replacement_index}].old_text duplicates an earlier range")
+                continue
+            seen_spans.add(span_key)
+            replacement_spans.append((span_start, span_end, new_text))
+
+        replacement_spans.sort(key=lambda span: span[0])
+        for previous_span, current_span in zip(replacement_spans, replacement_spans[1:]):
+            if previous_span[1] > current_span[0]:
+                errors.append("replacements contain overlapping old_text ranges")
+                break
+
+        if errors:
+            return {
+                "ok": False,
+                "file_path": response_file_path,
+                "plan": response_plan,
+                "diff": "",
+                "errors": errors,
+            }
+
+        after_parts: list[str] = []
+        cursor = 0
+        for span_start, span_end, new_text in replacement_spans:
+            after_parts.append(before_text[cursor:span_start])
+            after_parts.append(new_text)
+            cursor = span_end
+        after_parts.append(before_text[cursor:])
+        after_text = "".join(after_parts)
+
+        repo_path = self._format_repo_path(target_file)
+        diff = "".join(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=f"a/{repo_path}",
+                tofile=f"b/{repo_path}",
+            )
+        )
+
+        if not diff:
+            errors.append("replacements 未产生内容变化")
+            return {
+                "ok": False,
+                "file_path": response_file_path,
+                "plan": response_plan,
+                "diff": "",
+                "errors": errors,
+            }
+
+        return {
+            "ok": True,
+            "file_path": response_file_path,
+            "plan": response_plan,
+            "diff": diff,
+            "errors": [],
+        }
+
     def finish(self, answer: str) -> str:
         """输出最终答案。"""
 
@@ -242,6 +381,46 @@ class RepositoryTools:
             raise ToolError(f"path 必须位于 repo 目录内部: {path}") from error
 
         return resolved_path
+
+    def _validate_patch_contract(
+        self,
+        file_path: str,
+        plan: str,
+        replacements: list[dict[str, str]],
+    ) -> list[str]:
+        errors: list[str] = []
+
+        if not isinstance(file_path, str) or not file_path.strip():
+            errors.append("file_path 必须是非空字符串")
+        elif Path(file_path).is_absolute():
+            errors.append("file_path 必须是 repo 内相对路径，不能使用绝对路径")
+
+        if not isinstance(plan, str) or not plan.strip():
+            errors.append("plan 必须是非空字符串")
+
+        if not isinstance(replacements, list):
+            errors.append("replacements must be a list")
+            return errors
+        if not replacements:
+            errors.append("replacements must not be empty")
+            return errors
+
+        for replacement_index, replacement in enumerate(replacements, start=1):
+            if not isinstance(replacement, dict):
+                errors.append(f"replacements[{replacement_index}] must be an object")
+                continue
+            old_text = replacement.get("old_text")
+            new_text = replacement.get("new_text")
+            if not isinstance(old_text, str):
+                errors.append(f"replacements[{replacement_index}].old_text must be a string")
+            elif not old_text:
+                errors.append(f"replacements[{replacement_index}].old_text must not be empty")
+            if not isinstance(new_text, str):
+                errors.append(f"replacements[{replacement_index}].new_text must be a string")
+            elif not new_text:
+                errors.append(f"replacements[{replacement_index}].new_text must not be empty")
+
+        return errors
 
     def _validate_readable_file(self, file_path: Path) -> None:
         if not file_path.is_file():
