@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from config import MAX_STEPS
 from agent import CodeAnalysisAgent
+from eval_safety import write_eval_temp_marker
 from llm_client import LlmClient
 from logger import RunLogger
 from main import CliApplyPatchApproval, parse_args
@@ -118,6 +119,23 @@ class TestPromptV03SafetyFlow(unittest.TestCase):
 
 class TestMainApplyApproval(unittest.TestCase):
     """验证 CLI apply_patch 人工确认门。"""
+
+    def test_default_constructor_uses_manual_approval_and_calls_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            repository_tools, patch_id = self._create_saved_patch(repo_path)
+            approval_gate = CliApplyPatchApproval(repository_tools)
+            tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
+
+            with patch("builtins.input", return_value="yes") as mocked_input:
+                with redirect_stdout(io.StringIO()):
+                    tool_output = approval_gate.run_tool(tool_call)
+
+            mocked_input.assert_called_once_with("Approve apply_patch? [yes/y/approve]: ")
+            self.assertIsInstance(tool_output, dict)
+            apply_output = cast(dict[str, object], tool_output)
+            self.assertTrue(apply_output["ok"])
+            self.assertEqual("new line\n", (repo_path / "sample.txt").read_text())
 
     def test_approval_tokens_allow_apply_patch_after_preview(self) -> None:
         for approval_text in ["yes", " Y ", "APPROVE"]:
@@ -289,6 +307,71 @@ class TestMainApplyApproval(unittest.TestCase):
             events = self._read_run_events(repository_tools, patch_id)
             event_types = [str(event["event_type"]) for event in events]
             self.assertEqual(["proposed"], event_types)
+
+    def test_auto_for_eval_rejects_repo_without_marker_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            repository_tools, patch_id = self._create_saved_patch(repo_path)
+            approval_gate = CliApplyPatchApproval(
+                repository_tools,
+                approval_mode="auto_for_eval",
+                eval_run_id="run-1",
+            )
+            tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
+
+            with patch("builtins.input") as mocked_input:
+                with patch.object(repository_tools, "run_tool") as mocked_run_tool:
+                    with self.assertRaises(ToolError) as error_context:
+                        approval_gate.run_tool(tool_call)
+
+            self.assertIn("eval temp marker 不存在", str(error_context.exception))
+            mocked_input.assert_not_called()
+            mocked_run_tool.assert_not_called()
+            self.assertEqual("old line\n", (repo_path / "sample.txt").read_text())
+            events = self._read_run_events(repository_tools, patch_id)
+            event_types = [str(event["event_type"]) for event in events]
+            self.assertEqual(["proposed"], event_types)
+
+    def test_auto_for_eval_accepts_valid_marker_without_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            repo_path = temp_root / "repo"
+            repo_path.mkdir()
+            repository_tools, patch_id = self._create_saved_patch(repo_path)
+            write_eval_temp_marker(
+                repo_path=repo_path,
+                run_id="run-1",
+                case_id="case-1",
+                temp_root=temp_root,
+            )
+            approval_gate = CliApplyPatchApproval(
+                repository_tools,
+                approval_mode="auto_for_eval",
+                eval_run_id="run-1",
+            )
+            tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
+
+            with patch("builtins.input") as mocked_input:
+                tool_output = approval_gate.run_tool(tool_call)
+
+            mocked_input.assert_not_called()
+            self.assertIsInstance(tool_output, dict)
+            apply_output = cast(dict[str, object], tool_output)
+            self.assertTrue(apply_output["ok"])
+            self.assertEqual("new line\n", (repo_path / "sample.txt").read_text())
+            events = self._read_run_events(repository_tools, patch_id)
+            self.assertTrue(
+                any(
+                    event["event_type"] == "apply_confirmation"
+                    and event["status"] == "approved"
+                    and event["details"]
+                    == {"approved": True, "approval_mode": "auto_for_eval"}
+                    for event in events
+                )
+            )
+            self.assertTrue(
+                any(event["event_type"] == "apply_success" for event in events)
+            )
 
     def _create_saved_patch(self, repo_path: Path) -> tuple[RepositoryTools, str]:
         (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")

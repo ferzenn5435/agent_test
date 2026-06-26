@@ -12,6 +12,7 @@ from config import ConfigError, MAX_STEPS, load_llm_config_from_env
 from llm_client import LlmClient, LlmClientError
 from logger import RunLogger
 from tools import RepositoryTools, ToolError
+from eval_safety import EvalSafetyError, validate_eval_temp_repo
 
 
 APPROVAL_TOKENS = {"yes", "y", "approve"}
@@ -72,10 +73,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 class CliApplyPatchApproval:
-    """CLI 模式下的 apply_patch 人工确认门。"""
+    """CLI 模式下的 apply_patch 确认门。"""
 
-    def __init__(self, repository_tools: RepositoryTools) -> None:
+    def __init__(
+        self,
+        repository_tools: RepositoryTools,
+        approval_mode: str = "manual",
+        eval_run_id: str | None = None,
+    ) -> None:
+        if approval_mode not in {"manual", "auto_for_eval"}:
+            raise ValueError(
+                "approval_mode must be either 'manual' or 'auto_for_eval'"
+            )
+
         self.repository_tools = repository_tools
+        self.approval_mode = approval_mode
+        self.eval_run_id = eval_run_id
 
     def run_tool(self, tool_call: dict[str, object]) -> object:
         """执行工具调用，并在 apply_patch 前要求人工确认。"""
@@ -85,10 +98,13 @@ class CliApplyPatchApproval:
 
         patch_id = self._extract_patch_id(tool_call)
         patch_info = self._load_patch_info(patch_id)
+        if self.approval_mode == "auto_for_eval":
+            return self._run_auto_for_eval_apply(tool_call, patch_id)
+
         self._print_confirmation_prompt(patch_info)
         approval_text = input("Approve apply_patch? [yes/y/approve]: ")
         approved = approval_text.strip().lower() in APPROVAL_TOKENS
-        self._log_confirmation_decision(patch_id, approved)
+        self._log_confirmation_decision(patch_id, approved, self.approval_mode)
 
         if not approved:
             raise ToolError(
@@ -96,6 +112,20 @@ class CliApplyPatchApproval:
                 "no files were modified"
             )
 
+        return self.repository_tools.run_tool(tool_call)
+
+    def _run_auto_for_eval_apply(
+        self,
+        tool_call: dict[str, object],
+        patch_id: str,
+    ) -> object:
+        eval_run_id = self.eval_run_id if self.eval_run_id is not None else ""
+        try:
+            validate_eval_temp_repo(self.repository_tools.repo_root, eval_run_id)
+        except EvalSafetyError as error:
+            raise ToolError(str(error)) from error
+
+        self._log_confirmation_decision(patch_id, True, self.approval_mode)
         return self.repository_tools.run_tool(tool_call)
 
     def _extract_patch_id(self, tool_call: dict[str, object]) -> str:
@@ -153,13 +183,21 @@ class CliApplyPatchApproval:
         print("Patch preview:")
         print(str(patch_info["preview"]))
 
-    def _log_confirmation_decision(self, patch_id: str, approved: bool) -> None:
+    def _log_confirmation_decision(
+        self,
+        patch_id: str,
+        approved: bool,
+        approval_mode: str,
+    ) -> None:
         status = "approved" if approved else "rejected"
+        details: dict[str, object] = {"approved": approved}
+        if approval_mode == "auto_for_eval":
+            details["approval_mode"] = approval_mode
         self.repository_tools._append_run_event(
             patch_id=patch_id,
             event_type="apply_confirmation",
             status=status,
-            details={"approved": approved},
+            details=details,
         )
 
 

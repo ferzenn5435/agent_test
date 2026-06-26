@@ -10,6 +10,7 @@
 - 最大循环步数为 8。
 - 每次运行写入 `logs/run_YYYYMMDD_HHMMSS.json`。
 - v0.3 修改流程会把补丁保存到 `.repopilot/patches`，应用前展示补丁并等待用户确认，应用时在 `.repopilot/backups` 创建备份，在 `.repopilot/runs` 写入事件日志。
+- v0.4 提供编辑评测入口，用临时 fixture 副本验证 agent 的受控修改能力。
 
 ## 工具
 
@@ -33,6 +34,20 @@
 5. 空输入、`no` 或任意其他文本都会拒绝应用，agent 收到失败工具结果，目标文件不会被修改。
 6. 应用补丁时会在 `.repopilot/backups` 创建备份，并在 `.repopilot/runs` 记录 apply 和确认事件。
 7. 成功应用后应调用 `run_tests(command_name)`，可选命令为 `unit` 或 `compile`。
+
+## v0.4 编辑评测
+
+v0.4 编辑评测用于验证 agent 是否能在安全边界内完成小型代码修改，并用明确规则检查结果。运行命令：
+
+```powershell
+python run_edit_eval.py
+```
+
+每个评测用例都会把 `fixture` 复制到临时目录后再运行 agent，不会修改原始 fixture，也不会修改真实项目。完整结果写入 `.repopilot/evals/<timestamp>.json`，命令行只打印 `[PASS] case_id`、`[FAIL] case_id: reasons` 和通过数量摘要。
+
+`auto_for_eval` 只供评测 runner 在带 marker 校验的临时代码库内部使用，用来避免交互输入阻塞自动评测。普通 CLI 仍然要求用户手动批准 `apply_patch`，不要在日常使用中手动启用或创建 `auto_for_eval` 批准。
+
+评测用例位于 `eval_cases/edit_cases.json`，每个 case 包含 `id`、`fixture`、`prompt`、`max_steps`、`allowed_changed_files`、`must_contain`，并可选 `test_command` 和 `expect_no_business_changes`。`test_command` 只支持 `unit` 和 `compile`，仍然沿用 no arbitrary shell 和 no framework 约束。
 
 ## 配置
 
