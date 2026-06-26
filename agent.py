@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from config import MAX_STEPS
 from llm_client import LlmClient
@@ -24,11 +25,13 @@ class CodeAnalysisAgent:
         repository_tools: RepositoryTools,
         run_logger: RunLogger,
         max_steps: int = MAX_STEPS,
+        tool_runner: Callable[[dict[str, object]], object] | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.repository_tools = repository_tools
         self.run_logger = run_logger
         self.max_steps = max_steps
+        self.tool_runner = tool_runner or repository_tools.run_tool
 
     def answer(self, question: str) -> str:
         """运行 agent 并返回最终答案。"""
@@ -122,7 +125,7 @@ class CodeAnalysisAgent:
 
     def _run_tool(self, tool_call: dict[str, object]) -> dict[str, object]:
         try:
-            tool_output = self.repository_tools.run_tool(tool_call)
+            tool_output = self.tool_runner(tool_call)
         except ToolError as error:
             return {"ok": False, "error": str(error)}
 
