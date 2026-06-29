@@ -11,6 +11,7 @@
 - 每次运行写入 `logs/run_YYYYMMDD_HHMMSS.json`。
 - v0.3 修改流程会把补丁保存到 `.repopilot/patches`，应用前展示补丁并等待用户确认，应用时在 `.repopilot/backups` 创建备份，在 `.repopilot/runs` 写入事件日志。
 - v0.4 提供编辑评测入口，用临时 fixture 副本验证 agent 的受控修改能力。
+- v0.5 提供上下文统计、读取预算和项目索引工具，帮助 agent 先定位再按需读取文件。
 
 ## 工具
 
@@ -18,6 +19,8 @@
 - `read_file(path)`：读取 repo 内 UTF-8 文本文件，单文件最大 20KB，返回内容会带行号，例如 `12 | code here`。
 - `read_file_range(path, start_line, end_line)`：读取 repo 内 UTF-8 文本文件的闭区间行范围。
 - `search_text(keyword)`：搜索 repo 内文本，返回文件名、行号和上下文行，跳过二进制文件、隐藏目录、`.git`、`node_modules`、`build`、`dist`。
+- `build_repo_index(force=False)`：构建或复用 `.repopilot/index/<repo_id>/file_index.json` 项目文件索引，记录路径、扩展名、行数、大小和 Python 顶层符号，跳过 `.git`、缓存和构建目录。
+- `inspect_repo()`：基于项目索引返回紧凑概览，包括主 Python 模块、测试文件、入口候选和大文件提示；项目分析、定位入口或准备修改代码时优先使用它。
 - `propose_patch(instruction, diff)`：保存 unified diff 补丁提案到 `.repopilot/patches`，返回 `patch_id`、预览和影响路径，不修改目标文件。
 - `apply_patch(patch_id)`：应用已保存补丁。CLI 模式会先显示补丁路径、影响路径、风险提示和补丁预览，只有用户明确批准后才会修改文件，并会先写入 `.repopilot/backups` 备份。
 - `run_tests(command_name)`：执行白名单测试命令，只支持 `unit` 和 `compile`。`unit` 对应 `python -m unittest discover`，`compile` 对应 `python -m compileall .`。
@@ -48,6 +51,28 @@ python run_edit_eval.py
 `auto_for_eval` 只供评测 runner 在带 marker 校验的临时代码库内部使用，用来避免交互输入阻塞自动评测。普通 CLI 仍然要求用户手动批准 `apply_patch`，不要在日常使用中手动启用或创建 `auto_for_eval` 批准。
 
 评测用例位于 `eval_cases/edit_cases.json`，每个 case 包含 `id`、`fixture`、`prompt`、`max_steps`、`allowed_changed_files`、`must_contain`，并可选 `test_command` 和 `expect_no_business_changes`。`test_command` 只支持 `unit` 和 `compile`，仍然沿用 no arbitrary shell 和 no framework 约束。
+
+## v0.5 上下文管理与项目索引
+
+v0.5 目标是减少无关上下文读取：先用 `inspect_repo()` 获取紧凑项目概览，需要刷新缓存时再调用 `build_repo_index(force=True)`；定位到目标文件后，优先用 `read_file_range(path, start_line, end_line)` 读取必要片段。完整读取和搜索受以下阈值约束：`MAX_FULL_READ_LINES=300`、`MAX_FULL_READ_BYTES=20_000`、`MAX_RANGE_READ_LINES=120`、`MAX_TOOL_OUTPUT_CHARS=12_000`、`MAX_SEARCH_RESULTS=20`。
+
+每次 agent 运行会记录 `ContextStats`，字段固定为 `steps_used`、`total_tool_output_chars`、`messages_total_chars`、`files_read`、`ranges_read`、`search_calls`、`full_file_reads`。这些统计会写入运行日志和 edit eval 结果，用于检查是否完整读取了禁止文件、工具输出是否超过预算，以及上下文使用是否可追踪。
+
+编辑评测仍可运行：
+
+```powershell
+python run_edit_eval.py --cases eval_cases/edit_cases.json
+```
+
+v0.5 上下文评测使用独立用例文件：
+
+```powershell
+python run_edit_eval.py --cases eval_cases/context_cases.json
+```
+
+CLI 会记录结构化结果和上下文违规原因，例如 `must_not_read_full_files` 或 `max_total_tool_output_chars` 失败；真实 LLM 是否通过上下文用例取决于模型实际工具选择，不承诺每次都通过。
+
+项目保持纯 Python 安全工具调用实现：不使用 LangChain、LangGraph、LlamaIndex、MCP 或 vector DB，不提供 arbitrary shell，也不加入语义搜索、外部 agent 框架或联网协作。
 
 ## 配置
 

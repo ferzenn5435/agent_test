@@ -10,8 +10,502 @@ import sys
 import tools
 from unittest import mock
 from pathlib import Path
-from config import MAX_FILE_BYTES
+from config import (
+    MAX_FILE_BYTES,
+    MAX_FULL_READ_BYTES,
+    MAX_FULL_READ_LINES,
+    MAX_RANGE_READ_LINES,
+    MAX_SEARCH_RESULTS,
+    MAX_TOOL_OUTPUT_CHARS,
+)
+from context_stats import ContextStats
 from tools import RepositoryTools, ToolError
+
+
+class TestContextConstantsV05(unittest.TestCase):
+    """验证 v0.5 上下文管理常量。"""
+
+    def test_context_limit_constants_match_v05_schema(self) -> None:
+        self.assertEqual(300, MAX_FULL_READ_LINES)
+        self.assertEqual(20_000, MAX_FULL_READ_BYTES)
+        self.assertEqual(120, MAX_RANGE_READ_LINES)
+        self.assertEqual(12_000, MAX_TOOL_OUTPUT_CHARS)
+        self.assertEqual(20, MAX_SEARCH_RESULTS)
+
+
+class TestContextStatsV05(unittest.TestCase):
+    """验证 v0.5 ContextStats 的稳定序列化 schema。"""
+
+    expected_schema_keys = [
+        "steps_used",
+        "total_tool_output_chars",
+        "messages_total_chars",
+        "files_read",
+        "ranges_read",
+        "search_calls",
+        "full_file_reads",
+    ]
+
+    def test_to_dict_returns_fixed_json_serializable_schema(self) -> None:
+        context_stats = ContextStats(
+            steps_used=3,
+            total_tool_output_chars=456,
+            messages_total_chars=789,
+            files_read=("src\\agent.py", "README.md"),
+            ranges_read=(
+                {"path": "src\\tools.py", "start_line": 10, "end_line": 20},
+            ),
+            search_calls=2,
+            full_file_reads=("tests\\test_tools.py",),
+        )
+
+        stats_dict = context_stats.to_dict()
+
+        self.assertEqual(self.expected_schema_keys, list(stats_dict.keys()))
+        self.assertEqual(3, stats_dict["steps_used"])
+        self.assertEqual(456, stats_dict["total_tool_output_chars"])
+        self.assertEqual(789, stats_dict["messages_total_chars"])
+        self.assertEqual(["src/agent.py", "README.md"], stats_dict["files_read"])
+        self.assertEqual(
+            [{"path": "src/tools.py", "start_line": 10, "end_line": 20}],
+            stats_dict["ranges_read"],
+        )
+        self.assertEqual(2, stats_dict["search_calls"])
+        self.assertEqual(["tests/test_tools.py"], stats_dict["full_file_reads"])
+        json.dumps(stats_dict)
+
+    def test_default_constructor_to_dict_returns_empty_schema(self) -> None:
+        context_stats = ContextStats()
+
+        stats_dict = context_stats.to_dict()
+
+        self.assertEqual(self.expected_schema_keys, list(stats_dict.keys()))
+        self.assertEqual(0, stats_dict["steps_used"])
+        self.assertEqual(0, stats_dict["total_tool_output_chars"])
+        self.assertEqual(0, stats_dict["messages_total_chars"])
+        self.assertEqual([], stats_dict["files_read"])
+        self.assertEqual([], stats_dict["ranges_read"])
+        self.assertEqual(0, stats_dict["search_calls"])
+        self.assertEqual([], stats_dict["full_file_reads"])
+        json.dumps(stats_dict)
+
+
+class TestReadSearchContextV05(unittest.TestCase):
+    """验证 v0.5 读取和搜索上下文控制。"""
+
+    def setUp(self) -> None:
+        self.temp_repo_helper = V03TempRepoHelper()
+        self.repository_tools = self.temp_repo_helper.create_repository_tools()
+
+    def tearDown(self) -> None:
+        self.temp_repo_helper.cleanup()
+
+    def test_read_file_rejects_large_file(self) -> None:
+        self.temp_repo_helper.create_text_file(
+            "large_bytes.txt",
+            "a" * (MAX_FULL_READ_BYTES + 1),
+        )
+
+        with self.assertRaisesRegex(ToolError, "read_file_range") as error_context:
+            self.repository_tools.read_file("large_bytes.txt")
+
+        error_message = str(error_context.exception)
+        self.assertIn(str(MAX_FULL_READ_BYTES), error_message)
+        self.assertIn(str(MAX_FULL_READ_LINES), error_message)
+
+    def test_read_file_rejects_too_many_lines(self) -> None:
+        file_text = "".join("x\n" for _ in range(MAX_FULL_READ_LINES + 1))
+        self.temp_repo_helper.create_text_file("many_lines.txt", file_text)
+
+        with self.assertRaisesRegex(ToolError, "read_file_range") as error_context:
+            self.repository_tools.read_file("many_lines.txt")
+
+        error_message = str(error_context.exception)
+        self.assertIn(str(MAX_FULL_READ_LINES), error_message)
+        self.assertIn(str(MAX_FULL_READ_BYTES), error_message)
+
+    def test_read_file_keeps_numbered_format_for_small_file(self) -> None:
+        self.temp_repo_helper.create_text_file("small.txt", "alpha\nbeta\n")
+
+        file_content = self.repository_tools.read_file("small.txt")
+
+        self.assertEqual("1 | alpha\n2 | beta", file_content)
+
+    def test_read_file_range_reads_large_file_with_original_line_numbers(self) -> None:
+        large_lines = [f"line {line_number}" for line_number in range(1, MAX_FULL_READ_LINES + 20)]
+        self.temp_repo_helper.create_text_file("large_range.txt", "\n".join(large_lines) + "\n")
+
+        file_content = self.repository_tools.read_file_range("large_range.txt", 301, 303)
+
+        self.assertEqual(
+            "\n".join([
+                "301 | line 301",
+                "302 | line 302",
+                "303 | line 303",
+            ]),
+            file_content,
+        )
+
+    def test_read_file_range_rejects_invalid_range_and_beyond_eof(self) -> None:
+        self.temp_repo_helper.create_text_file("range.txt", "one\ntwo\nthree\n")
+
+        invalid_calls = [
+            (0, 1, "start_line"),
+            (3, 2, "end_line"),
+            (1, MAX_RANGE_READ_LINES + 1, str(MAX_RANGE_READ_LINES)),
+            (1, 4, "超过文件总行数"),
+        ]
+        for start_line, end_line, expected_error in invalid_calls:
+            with self.subTest(start_line=start_line, end_line=end_line):
+                with self.assertRaisesRegex(ToolError, expected_error):
+                    self.repository_tools.read_file_range("range.txt", start_line, end_line)
+
+    def test_search_text_path_glob_and_max_results(self) -> None:
+        self.temp_repo_helper.create_text_file("src/one.py", "needle one\n")
+        self.temp_repo_helper.create_text_file("src/two.py", "needle two\n")
+        self.temp_repo_helper.create_text_file("docs/ignored.md", "needle ignored\n")
+
+        matches = self.repository_tools.search_text(
+            "needle",
+            path_glob="src/*.py",
+            max_results=1,
+            context_lines=0,
+        )
+
+        self.assertEqual(1, len(matches))
+        self.assertIn("src/one.py:1", matches[0])
+        self.assertIn("1 | needle one", matches[0])
+        self.assertNotIn("docs/ignored.md", "\n".join(matches))
+
+    def test_search_text_context_lines(self) -> None:
+        self.temp_repo_helper.create_text_file(
+            "context.txt",
+            "before far\nbefore near\nneedle hit\nafter near\nafter far\n",
+        )
+
+        matches = self.repository_tools.search_text("needle", context_lines=1)
+
+        self.assertEqual(1, len(matches))
+        self.assertIn("2 | before near", matches[0])
+        self.assertIn("3 | needle hit", matches[0])
+        self.assertIn("4 | after near", matches[0])
+        self.assertNotIn("1 | before far", matches[0])
+        self.assertNotIn("5 | after far", matches[0])
+
+    def test_search_text_output_truncation_marker(self) -> None:
+        self.temp_repo_helper.create_text_file("long.txt", "needle " + "x" * 200 + "\n")
+
+        with mock.patch("tools.MAX_TOOL_OUTPUT_CHARS", new=30):
+            matches = self.repository_tools.search_text("needle", context_lines=0)
+
+        self.assertEqual(["...（结果已截断）"], matches)
+
+    def test_search_text_rejects_invalid_controls(self) -> None:
+        invalid_calls = [
+            {"max_results": 0},
+            {"max_results": MAX_SEARCH_RESULTS + 1},
+            {"context_lines": -1},
+            {"path_glob": "../*.py"},
+        ]
+
+        for kwargs in invalid_calls:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ToolError):
+                    self.repository_tools.search_text("needle", **kwargs)
+
+
+class TestRepoIndexV05(unittest.TestCase):
+    """验证 v0.5 项目文件索引工具。"""
+
+    def setUp(self) -> None:
+        self.temp_repo_helper = V03TempRepoHelper()
+        self.repository_tools = self.temp_repo_helper.create_repository_tools()
+
+    def tearDown(self) -> None:
+        self.temp_repo_helper.cleanup()
+
+    def _read_index(self, index_path: str) -> dict[str, object]:
+        full_index_path = self.temp_repo_helper.repo_root / index_path
+        return json.loads(full_index_path.read_text(encoding="utf-8"))
+
+    def _file_records_by_path(self, repo_index: dict[str, object]) -> dict[str, dict[str, object]]:
+        files = repo_index["files"]
+        self.assertIsInstance(files, list)
+        if not isinstance(files, list):
+            self.fail("files should be a list")
+        return {
+            str(file_record["path"]): file_record
+            for file_record in files
+            if isinstance(file_record, dict)
+        }
+
+    def test_build_repo_index_extracts_symbols(self) -> None:
+        self.temp_repo_helper.create_text_file(
+            "pkg/example.py",
+            "class Service:\n"
+            "    def run(self):\n"
+            "        return 1\n"
+            "    async def arun(self):\n"
+            "        return 2\n"
+            "\n"
+            "def helper():\n"
+            "    return 3\n"
+            "\n"
+            "async def async_helper():\n"
+            "    return 4\n",
+        )
+
+        build_result = self.repository_tools.build_repo_index(force=True)
+        repo_index = self._read_index(str(build_result["index_path"]))
+        records_by_path = self._file_records_by_path(repo_index)
+        example_record = records_by_path["pkg/example.py"]
+
+        self.assertIn("build_repo_index", self.repository_tools.tools)
+        self.assertEqual("built", build_result["status"])
+        self.assertEqual(".py", example_record["extension"])
+        self.assertEqual(11, example_record["line_count"])
+        self.assertEqual(
+            [
+                {"name": "Service", "kind": "class", "line": 1},
+                {"name": "run", "kind": "method", "line": 2},
+                {"name": "arun", "kind": "async_method", "line": 4},
+                {"name": "helper", "kind": "function", "line": 7},
+                {"name": "async_helper", "kind": "async_function", "line": 10},
+            ],
+            example_record["symbols"],
+        )
+
+    def test_build_repo_index_skips_excluded_dirs(self) -> None:
+        self.temp_repo_helper.create_text_file("src/kept.py", "def kept():\n    return True\n")
+        for skipped_dir_name in tools.REPO_INDEX_SKIPPED_DIR_NAMES:
+            self.temp_repo_helper.create_text_file(
+                f"{skipped_dir_name}/ignored.py",
+                "def ignored():\n    return False\n",
+            )
+
+        build_result = self.repository_tools.build_repo_index(force=True)
+        repo_index = self._read_index(str(build_result["index_path"]))
+        records_by_path = self._file_records_by_path(repo_index)
+
+        self.assertIn("src/kept.py", records_by_path)
+        for skipped_dir_name in tools.REPO_INDEX_SKIPPED_DIR_NAMES:
+            self.assertNotIn(f"{skipped_dir_name}/ignored.py", records_by_path)
+        self.assertTrue(
+            all(not path.startswith(".repopilot/index/") for path in records_by_path)
+        )
+
+    def test_build_repo_index_records_syntax_error_file(self) -> None:
+        self.temp_repo_helper.create_text_file("broken.py", "def broken(:\n    pass\n")
+
+        build_result = self.repository_tools.build_repo_index(force=True)
+        repo_index = self._read_index(str(build_result["index_path"]))
+        records_by_path = self._file_records_by_path(repo_index)
+        broken_record = records_by_path["broken.py"]
+
+        self.assertEqual([], broken_record["symbols"])
+        self.assertIn("syntax error", str(broken_record["error"]))
+
+    def test_build_repo_index_reuses_cache_when_force_false(self) -> None:
+        self.temp_repo_helper.create_text_file("src/original.py", "def original():\n    return 1\n")
+        first_result = self.repository_tools.build_repo_index(force=True)
+        self.temp_repo_helper.create_text_file("src/new_file.py", "def new_file():\n    return 2\n")
+
+        cached_result = self.repository_tools.build_repo_index()
+        repo_index = self._read_index(str(cached_result["index_path"]))
+        records_by_path = self._file_records_by_path(repo_index)
+
+        self.assertEqual("cached", cached_result["status"])
+        self.assertEqual(first_result["index_path"], cached_result["index_path"])
+        self.assertIn("src/original.py", records_by_path)
+        self.assertNotIn("src/new_file.py", records_by_path)
+
+    def test_build_repo_index_creates_output_file(self) -> None:
+        self.temp_repo_helper.create_text_file("README.md", "hello\n")
+
+        build_result = self.repository_tools.build_repo_index(force=True)
+        index_path = self.temp_repo_helper.repo_root / str(build_result["index_path"])
+        repo_index = json.loads(index_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(index_path.is_file())
+        self.assertEqual(build_result["repo_id"], repo_index["repo_id"])
+        self.assertEqual("README.md", repo_index["files"][0]["path"])
+
+    def test_build_repo_index_serializes_only_relative_posix_paths(self) -> None:
+        self.temp_repo_helper.create_text_file("src/main.py", "def main():\n    return 0\n")
+        self.temp_repo_helper.create_text_file(
+            ".repopilot/index/ignored/file_index.json",
+            '{"path": "ignored.py"}\n',
+        )
+
+        build_result = self.repository_tools.build_repo_index(force=True)
+        index_path = self.temp_repo_helper.repo_root / str(build_result["index_path"])
+        serialized_index = index_path.read_text(encoding="utf-8")
+        repo_index = json.loads(serialized_index)
+        records_by_path = self._file_records_by_path(repo_index)
+
+        self.assertNotIn(str(self.temp_repo_helper.repo_root), serialized_index)
+        self.assertNotIn("\\", serialized_index)
+        self.assertIn("src/main.py", records_by_path)
+        self.assertTrue(
+            all(
+                not path.startswith("/")
+                and ":" not in path
+                and "\\" not in path
+                and not path.startswith(".repopilot/index/")
+                for path in records_by_path
+            )
+        )
+
+
+class TestInspectRepoV05(unittest.TestCase):
+    """验证 v0.5 紧凑项目概览工具。"""
+
+    def setUp(self) -> None:
+        self.temp_repo_helper = V03TempRepoHelper()
+        self.repository_tools = self.temp_repo_helper.create_repository_tools()
+
+    def tearDown(self) -> None:
+        self.temp_repo_helper.cleanup()
+
+    def test_inspect_repo_contains_core_modules(self) -> None:
+        self.temp_repo_helper.create_text_file(
+            "src/core.py",
+            "class Service:\n"
+            "    def run(self):\n"
+            "        return 1\n"
+            "\n"
+            "def helper():\n"
+            "    return 2\n",
+        )
+        self.temp_repo_helper.create_text_file(
+            "main.py",
+            "def main():\n"
+            "    return 0\n"
+            "\n"
+            "if __name__ == \"__main__\":\n"
+            "    main()\n",
+        )
+        self.temp_repo_helper.create_text_file(
+            "tests/test_core.py",
+            "def test_service():\n"
+            "    assert True\n",
+        )
+        self.temp_repo_helper.create_text_file("README.md", "hello\n")
+
+        inspect_result = self.repository_tools.inspect_repo()
+
+        self.assertIn("inspect_repo", self.repository_tools.tools)
+        self.assertEqual(True, inspect_result["ok"])
+        self.assertEqual("built", inspect_result["index_status"])
+        self.assertEqual(4, inspect_result["file_count"])
+        self.assertEqual(3, inspect_result["python_file_count"])
+        self.assertTrue((self.temp_repo_helper.repo_root / str(inspect_result["index_path"])).is_file())
+
+        main_python_modules = inspect_result["main_python_modules"]
+        test_files = inspect_result["test_files"]
+        entrypoint_candidates = inspect_result["entrypoint_candidates"]
+        if not isinstance(main_python_modules, list):
+            self.fail("main_python_modules should be a list")
+        if not isinstance(test_files, list):
+            self.fail("test_files should be a list")
+        if not isinstance(entrypoint_candidates, list):
+            self.fail("entrypoint_candidates should be a list")
+
+        main_module_paths = [
+            module["path"]
+            for module in main_python_modules
+            if isinstance(module, dict)
+        ]
+        test_file_paths = [
+            test_file["path"]
+            for test_file in test_files
+            if isinstance(test_file, dict)
+        ]
+        entrypoint_paths = [
+            entrypoint["path"]
+            for entrypoint in entrypoint_candidates
+            if isinstance(entrypoint, dict)
+        ]
+
+        self.assertEqual("src/core.py", main_module_paths[0])
+        self.assertIn("main.py", entrypoint_paths)
+        self.assertIn("tests/test_core.py", test_file_paths)
+        self.assertTrue(
+            all(not path.startswith(".repopilot/index/") for path in main_module_paths)
+        )
+
+        cached_result = self.repository_tools.inspect_repo()
+
+        self.assertEqual("cached", cached_result["index_status"])
+
+    def test_inspect_repo_output_is_compact(self) -> None:
+        large_file_body = "large-body-marker\n" * (MAX_FULL_READ_LINES + 1)
+        self.temp_repo_helper.create_text_file("notes/large_notes.md", large_file_body)
+        self.temp_repo_helper.create_text_file(
+            "app.py",
+            "def main():\n"
+            "    return \"ok\"\n",
+        )
+        self.temp_repo_helper.create_text_file(
+            "pkg/worker.py",
+            "def work():\n"
+            "    return 1\n",
+        )
+        self.temp_repo_helper.create_text_file(
+            "tests/test_worker.py",
+            "def test_work():\n"
+            "    assert True\n",
+        )
+
+        inspect_result = self.repository_tools.inspect_repo()
+        serialized_result = json.dumps(inspect_result, ensure_ascii=False, sort_keys=True)
+        large_files = inspect_result["large_files"]
+        if not isinstance(large_files, list):
+            self.fail("large_files should be a list")
+        large_file_records = [
+            file_record
+            for file_record in large_files
+            if isinstance(file_record, dict) and file_record.get("path") == "notes/large_notes.md"
+        ]
+
+        self.assertLessEqual(len(serialized_result), MAX_TOOL_OUTPUT_CHARS)
+        self.assertNotIn("large-body-marker", serialized_result)
+        self.assertEqual(1, len(large_file_records))
+        self.assertTrue(large_file_records[0]["exceeds_full_read_threshold"])
+        self.assertTrue(large_file_records[0]["exceeds_lines_threshold"])
+        self.assertIn("app.py", serialized_result)
+        self.assertIn("tests/test_worker.py", serialized_result)
+
+    def test_inspect_repo_respects_small_output_budget(self) -> None:
+        for file_number in range(20):
+            self.temp_repo_helper.create_text_file(
+                f"src/package_with_long_name_{file_number}/module_with_long_name_{file_number}.py",
+                "class Service:\n"
+                "    def run(self):\n"
+                "        return 1\n"
+                "\n"
+                "def helper():\n"
+                "    return 2\n",
+            )
+        required_keys = {
+            "ok",
+            "index_status",
+            "index_path",
+            "file_count",
+            "python_file_count",
+            "main_python_modules",
+            "test_files",
+            "entrypoint_candidates",
+            "large_files",
+        }
+
+        with mock.patch("tools.MAX_TOOL_OUTPUT_CHARS", new=500):
+            inspect_result = self.repository_tools.inspect_repo()
+            serialized_result = json.dumps(inspect_result, ensure_ascii=False, sort_keys=True)
+
+        self.assertLessEqual(len(serialized_result), 500)
+        self.assertTrue(required_keys.issubset(inspect_result.keys()))
+        self.assertEqual(True, inspect_result["truncated"])
 
 
 class V03TempRepoHelper:
@@ -145,11 +639,11 @@ class RepositoryToolsTest(unittest.TestCase):
         self.assertIn("tools.py", entries)
         self.assertIn("README.md", entries)
 
-    def test_read_file_returns_numbered_agent_content(self) -> None:
-        file_content = self.repository_tools.read_file("agent.py")
+    def test_read_file_returns_numbered_project_content(self) -> None:
+        file_content = self.repository_tools.read_file("context_stats.py")
 
-        self.assertIn('1 | """LLM + 工具调用循环。"""', file_content)
-        self.assertIn("8 | from config import MAX_STEPS", file_content)
+        self.assertIn('1 | """上下文统计 schema。"""', file_content)
+        self.assertIn("13 | class ContextStats:", file_content)
 
     def test_search_text_finds_max_steps_with_context(self) -> None:
         matches = self.repository_tools.search_text("MAX_STEPS")
@@ -815,10 +1309,9 @@ class TestReadFileRange(unittest.TestCase):
 
         self.assertEqual("7 | from config import MAX_STEPS", file_content)
 
-    def test_read_file_range_start_beyond_eof_returns_empty_string(self) -> None:
-        file_content = self.repository_tools.read_file_range("agent.py", 10_000, 10_001)
-
-        self.assertEqual("", file_content)
+    def test_read_file_range_start_beyond_eof_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ToolError, "超过文件总行数"):
+            self.repository_tools.read_file_range("agent.py", 10_000, 10_001)
 
     def test_read_file_range_rejects_invalid_ranges(self) -> None:
         invalid_calls = [
@@ -863,11 +1356,12 @@ class TestReadFileRange(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "UTF-8"):
             self.repository_tools.read_file_range("range_invalid_utf8.txt", 1, 1)
 
-    def test_read_file_range_rejects_oversized_file(self) -> None:
+    def test_read_file_range_allows_oversized_file(self) -> None:
         self.create_file("range_oversized.txt", "a" * (MAX_FILE_BYTES + 1))
 
-        with self.assertRaisesRegex(ToolError, "20KB"):
-            self.repository_tools.read_file_range("range_oversized.txt", 1, 1)
+        file_content = self.repository_tools.read_file_range("range_oversized.txt", 1, 1)
+
+        self.assertEqual(f"1 | {'a' * (MAX_FILE_BYTES + 1)}", file_content)
 
 
 class TestUnifiedDiffValidation(unittest.TestCase):

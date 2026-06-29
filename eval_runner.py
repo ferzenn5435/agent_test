@@ -48,6 +48,8 @@ class EditEvalCase:
     must_contain: tuple[MustContainRule, ...]
     test_command: str | None = None
     expect_no_business_changes: bool = False
+    must_not_read_full_files: tuple[str, ...] = ()
+    max_total_tool_output_chars: int | None = None
     raw_case: dict[str, object] | None = None
 
 
@@ -63,6 +65,7 @@ class EditEvalResult:
     final_answer: str | None
     error: str | None
     test_results: dict[str, object] | None
+    context_stats: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -256,6 +259,16 @@ def load_edit_cases(cases_path: Path) -> list[EditEvalCase]:
             case_index,
         )
         must_contain = _normalize_must_contain(raw_case.get("must_contain"), case_index)
+        must_not_read_full_files = _normalize_optional_relative_paths(
+            raw_case.get("must_not_read_full_files"),
+            case_index,
+            "must_not_read_full_files",
+        )
+        max_total_tool_output_chars = _normalize_optional_positive_int(
+            raw_case.get("max_total_tool_output_chars"),
+            case_index,
+            "max_total_tool_output_chars",
+        )
         test_command = raw_case.get("test_command")
 
         if test_command is not None:
@@ -286,6 +299,8 @@ def load_edit_cases(cases_path: Path) -> list[EditEvalCase]:
                 must_contain=must_contain,
                 test_command=test_command,
                 expect_no_business_changes=expect_no_business_changes,
+                must_not_read_full_files=must_not_read_full_files,
+                max_total_tool_output_chars=max_total_tool_output_chars,
                 raw_case=dict(raw_case),
             )
         )
@@ -306,6 +321,7 @@ def run_edit_case(
     final_answer: str | None = None
     error_message: str | None = None
     test_results: dict[str, object] | None = None
+    context_stats: dict[str, object] | None = None
     reasons: list[str] = []
 
     try:
@@ -360,6 +376,8 @@ def run_edit_case(
             steps = _count_logger_steps(run_logger)
             final_answer = _optional_string(run_logger.payload.get("final_answer"))
             error_message = _optional_string(run_logger.payload.get("error"))
+            context_stats = _optional_context_stats(run_logger.payload.get("context_stats"))
+            reasons.extend(_check_context_constraints(case, context_stats))
 
             if case_exception is not None:
                 error_message = str(case_exception)
@@ -373,6 +391,7 @@ def run_edit_case(
                     final_answer=final_answer,
                     error=error_message,
                     test_results=test_results,
+                    context_stats=context_stats,
                 )
 
             if not _logger_finished(run_logger):
@@ -415,6 +434,7 @@ def run_edit_case(
         final_answer=final_answer,
         error=error_message,
         test_results=test_results,
+        context_stats=context_stats,
     )
 
 
@@ -488,6 +508,55 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _optional_context_stats(value: object) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return dict(value)
+    return None
+
+
+def _check_context_constraints(
+    case: EditEvalCase,
+    context_stats: dict[str, object] | None,
+) -> list[str]:
+    if context_stats is None:
+        return []
+
+    errors: list[str] = []
+    full_file_reads = _normalize_context_path_list(context_stats.get("full_file_reads"))
+    for forbidden_path in case.must_not_read_full_files:
+        if forbidden_path in full_file_reads:
+            errors.append(
+                "must_not_read_full_files 违规: "
+                f"forbidden_path={forbidden_path}, "
+                f"actual_full_file_reads={full_file_reads}"
+            )
+
+    total_tool_output_chars = context_stats.get("total_tool_output_chars")
+    if (
+        case.max_total_tool_output_chars is not None
+        and isinstance(total_tool_output_chars, int)
+        and not isinstance(total_tool_output_chars, bool)
+        and total_tool_output_chars > case.max_total_tool_output_chars
+    ):
+        errors.append(
+            "max_total_tool_output_chars 违规: "
+            f"limit={case.max_total_tool_output_chars}, "
+            f"actual={total_tool_output_chars}"
+        )
+
+    return errors
+
+
+def _normalize_context_path_list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    normalized_paths: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            normalized_paths.append(item.replace("\\", "/"))
+    return tuple(normalized_paths)
 
 
 def _logger_finished(run_logger: RunLogger) -> bool:
@@ -571,41 +640,76 @@ def _normalize_max_steps(raw_value: object | None, case_index: int) -> int:
 def _normalize_allowed_changed_files(raw_value: object | None, case_index: int) -> tuple[str, ...]:
     """规范化并校验 allowed_changed_files。"""
 
+    return _normalize_required_relative_paths(raw_value, case_index, "allowed_changed_files")
+
+
+def _normalize_required_relative_paths(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> tuple[str, ...]:
     if not isinstance(raw_value, list):
         raise EditEvalConfigError(
-            f"第 {case_index} 条用例 allowed_changed_files 必须是字符串数组"
+            f"第 {case_index} 条用例 {field_name} 必须是字符串数组"
         )
 
+    return _normalize_relative_path_list(raw_value, case_index, field_name)
+
+
+def _normalize_optional_relative_paths(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list):
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是字符串数组"
+        )
+
+    return _normalize_relative_path_list(raw_value, case_index, field_name)
+
+
+def _normalize_relative_path_list(
+    raw_paths: list[object],
+    case_index: int,
+    field_name: str,
+) -> tuple[str, ...]:
+
     normalized_files: list[str] = []
-    for changed_file in raw_value:
-        if not isinstance(changed_file, str):
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str):
             raise EditEvalConfigError(
-                f"第 {case_index} 条用例 allowed_changed_files 包含非字符串"
+                f"第 {case_index} 条用例 {field_name} 包含非字符串"
             )
-        normalized_file = changed_file.replace("\\", "/").strip()
-        if not normalized_file:
+        try:
+            normalized_file = normalize_relative_path(raw_path)
+        except ValueError as error:
             raise EditEvalConfigError(
-                f"第 {case_index} 条用例 allowed_changed_files 包含空路径"
-            )
-        if (
-            normalized_file.startswith("/")
-            or Path(normalized_file).is_absolute()
-            or _is_windows_absolute_path(normalized_file)
-        ):
-            raise EditEvalConfigError(
-                f"第 {case_index} 条用例 allowed_changed_files 不允许绝对路径"
-            )
-        if normalized_file.startswith("~/"):
-            raise EditEvalConfigError(
-                f"第 {case_index} 条用例 allowed_changed_files 不允许使用绝对路径或~路径"
-            )
-        if any(segment == ".." for segment in normalized_file.split("/")):
-            raise EditEvalConfigError(
-                f"第 {case_index} 条用例 allowed_changed_files 不允许包含 .."
-            )
+                f"第 {case_index} 条用例 {field_name} 包含非法路径 {raw_path!r}: {error}"
+            ) from error
         normalized_files.append(normalized_file)
 
     return tuple(normalized_files)
+
+
+def _normalize_optional_positive_int(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> int | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, int) or isinstance(raw_value, bool):
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是正整数或 null"
+        )
+    if raw_value <= 0:
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是正整数或 null"
+        )
+    return raw_value
 
 
 def _is_windows_absolute_path(value: str) -> bool:

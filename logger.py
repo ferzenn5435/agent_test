@@ -26,6 +26,7 @@ class RunLogger:
             "steps": [],
             "final_answer": None,
             "error": None,
+            "context_stats": None,
         }
         self.save()
 
@@ -62,6 +63,12 @@ class RunLogger:
         """记录运行错误。"""
 
         self.payload["error"] = error_message
+        self.save()
+
+    def set_context_stats(self, stats: dict[str, object]) -> None:
+        """记录 agent 提供的最终上下文统计。"""
+
+        self.payload["context_stats"] = stats
         self.save()
 
     def save(self) -> None:

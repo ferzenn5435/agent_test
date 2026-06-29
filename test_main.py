@@ -8,6 +8,7 @@ import json
 import subprocess
 import tempfile
 from contextlib import redirect_stdout
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -34,6 +35,80 @@ V03_TOOL_DESCRIPTIONS = "\n".join(
         "- finish: 完成任务并输出最终答案",
     ]
 )
+
+V05_TOOL_DESCRIPTIONS = "\n".join(
+    [
+        *V03_TOOL_DESCRIPTIONS.splitlines()[:4],
+        "- build_repo_index: 构建或读取项目文件索引",
+        "- inspect_repo: 生成紧凑项目概览",
+        *V03_TOOL_DESCRIPTIONS.splitlines()[4:],
+    ]
+)
+
+
+class FakeLlmClient:
+    """按顺序返回内容并记录每次收到的 messages。"""
+
+    def __init__(self, outputs: Sequence[str | Callable[[list[dict[str, str]]], str]]) -> None:
+        self.outputs = list(outputs)
+        self.messages_by_call: list[list[dict[str, str]]] = []
+        self.call_count = 0
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        self.messages_by_call.append([dict(message) for message in messages])
+        if self.call_count >= len(self.outputs):
+            raise AssertionError("fake LLM 没有更多输出")
+        output = self.outputs[self.call_count]
+        self.call_count += 1
+        if callable(output):
+            return output(messages)
+        return output
+
+
+class FakeRunLogger:
+    """记录 agent 写入 logger 的原始步骤。"""
+
+    def __init__(self) -> None:
+        self.steps: list[dict[str, object]] = []
+        self.final_answer: str | None = None
+        self.error: str | None = None
+        self.context_stats: dict[str, object] | None = None
+
+    def record_step(
+        self,
+        step_number: int,
+        model_output: str,
+        tool_call: dict[str, object] | None,
+        tool_result: dict[str, object],
+    ) -> None:
+        self.steps.append(
+            {
+                "step_number": step_number,
+                "model_output": model_output,
+                "tool_call": tool_call,
+                "tool_result": tool_result,
+            }
+        )
+
+    def set_final_answer(self, final_answer: str) -> None:
+        self.final_answer = final_answer
+
+    def set_error(self, error_message: str) -> None:
+        self.error = error_message
+
+    def set_context_stats(self, stats: dict[str, object]) -> None:
+        self.context_stats = dict(stats)
+
+
+def _agent_tool_call(tool: str, args: dict[str, object]) -> str:
+    return json.dumps(
+        {
+            "thought": f"调用 {tool}",
+            "tool": tool,
+            "args": args,
+        },
+        ensure_ascii=False,
+    )
 
 
 class MainParserTest(unittest.TestCase):
@@ -478,6 +553,224 @@ class TestReadmeV03Docs(unittest.TestCase):
         self.assertNotIn("propose_patch(file_path", self.eval_text)
         self.assertNotIn("replacements", self.eval_text)
         self.assertNotIn("五", self.eval_text)
+
+
+class TestAgentContextV05(unittest.TestCase):
+    """验证 agent loop 的上下文统计与 observation 压缩。"""
+
+    def test_compacts_older_observations_only_in_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            for file_name, file_text in {
+                "one.txt": "alpha raw observation\n",
+                "two.txt": "bravo raw observation\n",
+                "three.txt": "charlie raw observation\n",
+                "four.txt": "delta raw observation\n",
+            }.items():
+                (repo_path / file_name).write_text(file_text, encoding="utf-8")
+            fake_llm = FakeLlmClient(
+                [
+                    _agent_tool_call("read_file", {"path": "one.txt"}),
+                    _agent_tool_call("read_file", {"path": "two.txt"}),
+                    _agent_tool_call("read_file", {"path": "three.txt"}),
+                    _agent_tool_call("read_file", {"path": "four.txt"}),
+                    _agent_tool_call("finish", {"answer": "完成"}),
+                ]
+            )
+            fake_logger = FakeRunLogger()
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=5,
+            )
+
+            final_answer = agent.answer("读取四个文件后完成")
+
+            self.assertEqual("完成", final_answer)
+            self.assertEqual(5, fake_llm.call_count)
+            last_messages = fake_llm.messages_by_call[-1]
+            compact_messages = [
+                message["content"]
+                for message in last_messages
+                if "[compact observation]" in message["content"]
+            ]
+            self.assertEqual(1, len(compact_messages), last_messages)
+            self.assertIn("tool=read_file", compact_messages[0])
+            self.assertIn("path=one.txt", compact_messages[0])
+            last_payload = "\n".join(message["content"] for message in last_messages)
+            self.assertNotIn("alpha raw observation", last_payload)
+            self.assertIn("bravo raw observation", last_payload)
+            self.assertIn("charlie raw observation", last_payload)
+            self.assertIn("delta raw observation", last_payload)
+
+            first_step_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
+            self.assertTrue(first_step_result["ok"])
+            self.assertIn("alpha raw observation", str(first_step_result["output"]))
+            self.assertNotIn("[compact observation]", str(first_step_result["output"]))
+
+    def test_context_stats_count_reads_ranges_and_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            source_dir = repo_path / "pkg"
+            source_dir.mkdir()
+            (source_dir / "sample.py").write_text(
+                "def target():\n    return 'needle'\n",
+                encoding="utf-8",
+            )
+            fake_llm = FakeLlmClient(
+                [
+                    "不是 JSON",
+                    _agent_tool_call("read_file", {"path": "pkg\\sample.py"}),
+                    _agent_tool_call(
+                        "read_file_range",
+                        {"path": "pkg/sample.py", "start_line": 1, "end_line": 2},
+                    ),
+                    _agent_tool_call(
+                        "search_text",
+                        {"keyword": "absent", "path_glob": "pkg/*.py"},
+                    ),
+                    _agent_tool_call("finish", {"answer": "完成"}),
+                ]
+            )
+            fake_logger = FakeRunLogger()
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=5,
+            )
+
+            final_answer = agent.answer("统计上下文")
+
+            self.assertEqual("完成", final_answer)
+            context_stats = agent.context_stats.to_dict()
+            self.assertEqual(5, context_stats["steps_used"])
+            self.assertEqual(["pkg/sample.py"], context_stats["files_read"])
+            self.assertEqual(["pkg/sample.py"], context_stats["full_file_reads"])
+            self.assertEqual(
+                [{"path": "pkg/sample.py", "start_line": 1, "end_line": 2}],
+                context_stats["ranges_read"],
+            )
+            self.assertEqual(1, context_stats["search_calls"])
+            expected_output_chars = sum(
+                len(
+                    json.dumps(
+                        cast(dict[str, object], step["tool_result"]),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                for step in fake_logger.steps
+            )
+            self.assertEqual(
+                expected_output_chars,
+                context_stats["total_tool_output_chars"],
+            )
+            self.assertGreater(cast(int, context_stats["messages_total_chars"]), 0)
+
+    def test_logger_writes_context_stats_on_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "sample.py").write_text("print('ok')\n", encoding="utf-8")
+            finish_logger = FakeRunLogger()
+            finish_agent = CodeAnalysisAgent(
+                llm_client=cast(
+                    LlmClient,
+                    FakeLlmClient(
+                        [
+                            _agent_tool_call("read_file", {"path": "sample.py"}),
+                            _agent_tool_call("finish", {"answer": "完成"}),
+                        ]
+                    ),
+                ),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, finish_logger),
+                max_steps=2,
+            )
+
+            final_answer = finish_agent.answer("读取后完成")
+
+            self.assertEqual("完成", final_answer)
+            self.assertEqual(finish_agent.context_stats.to_dict(), finish_logger.context_stats)
+            self.assertEqual(2, cast(dict[str, object], finish_logger.context_stats)["steps_used"])
+
+            max_steps_logger = FakeRunLogger()
+            max_steps_agent = CodeAnalysisAgent(
+                llm_client=cast(
+                    LlmClient,
+                    FakeLlmClient([_agent_tool_call("read_file", {"path": "sample.py"})]),
+                ),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, max_steps_logger),
+                max_steps=1,
+            )
+
+            max_steps_answer = max_steps_agent.answer("不调用 finish")
+
+            self.assertIn("达到最大循环步数 1", max_steps_answer)
+            self.assertEqual(max_steps_agent.context_stats.to_dict(), max_steps_logger.context_stats)
+            self.assertEqual(1, cast(dict[str, object], max_steps_logger.context_stats)["steps_used"])
+
+    def test_logger_keeps_full_tool_results_after_compaction(self) -> None:
+        large_observation = "raw-line\n" * 200
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            for file_name in ["one.txt", "two.txt", "three.txt", "four.txt"]:
+                (repo_path / file_name).write_text(large_observation, encoding="utf-8")
+            fake_llm = FakeLlmClient(
+                [
+                    _agent_tool_call("read_file", {"path": "one.txt"}),
+                    _agent_tool_call("read_file", {"path": "two.txt"}),
+                    _agent_tool_call("read_file", {"path": "three.txt"}),
+                    _agent_tool_call("read_file", {"path": "four.txt"}),
+                    _agent_tool_call("finish", {"answer": "完成"}),
+                ]
+            )
+            fake_logger = FakeRunLogger()
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=5,
+            )
+
+            final_answer = agent.answer("读取四个文件后完成")
+
+            self.assertEqual("完成", final_answer)
+            compacted_llm_payload = "\n".join(
+                message["content"] for message in fake_llm.messages_by_call[-1]
+            )
+            self.assertIn("[compact observation]", compacted_llm_payload)
+            self.assertNotIn(large_observation.strip(), compacted_llm_payload)
+            first_step_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
+            self.assertTrue(first_step_result["ok"])
+            self.assertIn("1 | raw-line", str(first_step_result["output"]))
+            self.assertIn("200 | raw-line", str(first_step_result["output"]))
+            self.assertNotIn("[compact observation]", str(first_step_result["output"]))
+
+
+class TestPromptContextV05(unittest.TestCase):
+    """验证 v0.5 上下文管理 prompt 规则。"""
+
+    def setUp(self) -> None:
+        self.prompt = build_system_prompt(V05_TOOL_DESCRIPTIONS)
+
+    def test_tool_whitelist_includes_repo_index_and_inspect_repo(self) -> None:
+        self.assertIn("build_repo_index", self.prompt)
+        self.assertIn("inspect_repo", self.prompt)
+        self.assertIn(V05_TOOL_DESCRIPTIONS, self.prompt)
+        self.assertIn("tool 只能是", self.prompt)
+
+    def test_prefers_inspect_repo_for_project_analysis_and_modification(self) -> None:
+        self.assertIn("项目分析或修改任务应优先调用 inspect_repo", self.prompt)
+        self.assertIn("项目分析、定位入口或准备修改代码时，优先使用 inspect_repo", self.prompt)
+        self.assertIn("只有需要刷新索引时才调用 build_repo_index", self.prompt)
+
+    def test_requires_ranges_for_large_files_and_evidence_in_final_answer(self) -> None:
+        self.assertIn("优先使用 read_file_range", self.prompt)
+        self.assertIn("禁止完整读取与任务无关的大文件", self.prompt)
+        self.assertIn("文件名、函数名、类名、行号和已读取证据", self.prompt)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -14,7 +15,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from config import MAX_FILE_BYTES
+from config import (
+    MAX_FILE_BYTES,
+    MAX_FULL_READ_BYTES,
+    MAX_FULL_READ_LINES,
+    MAX_RANGE_READ_LINES,
+    MAX_SEARCH_RESULTS,
+    MAX_TOOL_OUTPUT_CHARS,
+)
 import config
 
 RUN_TEST_OUTPUT_MAX_BYTES = getattr(config, "RUN_TEST_OUTPUT_MAX_BYTES", 20 * 1024)
@@ -30,6 +38,16 @@ SKIPPED_DIR_NAMES = {
     "node_modules",
     "build",
     "dist",
+}
+REPO_INDEX_SKIPPED_DIR_NAMES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    "logs",
+    ".repopilot",
+    "node_modules",
+    "dist",
+    "build",
 }
 SECRET_FILE_NAMES = {
     ".env",
@@ -94,21 +112,37 @@ class RepositoryTools:
             ),
             "read_file": ToolSpec(
                 name="read_file",
-                description='读取 repo 内 UTF-8 文本文件并返回带行号内容，最大 20KB，参数: {"path": "相对路径"}',
+                description=(
+                    '读取 repo 内 UTF-8 文本文件并返回带行号内容，超过完整读取阈值时改用 '
+                    'read_file_range，参数: {"path": "相对路径"}'
+                ),
                 function=self.read_file,
             ),
             "read_file_range": ToolSpec(
                 name="read_file_range",
                 description=(
-                    '读取 repo 内 UTF-8 文本文件的闭区间行范围并返回带行号内容，最大 20KB，'
+                    '读取 repo 内 UTF-8 文本文件的闭区间行范围并返回带行号内容，'
                     '参数: {"path": "相对路径", "start_line": 1, "end_line": 10}'
                 ),
                 function=self.read_file_range,
             ),
             "search_text": ToolSpec(
                 name="search_text",
-                description='在 repo 内搜索文本关键字，返回文件名、行号和带行号上下文，参数: {"keyword": "关键字"}',
+                description=(
+                    '在 repo 内按字面量搜索文本关键字，返回文件名、行号和带行号上下文，参数: '
+                    '{"keyword": "关键字", "path_glob": "src/*.py", "max_results": 20, "context_lines": 2}'
+                ),
                 function=self.search_text,
+            ),
+            "build_repo_index": ToolSpec(
+                name="build_repo_index",
+                description='构建或读取项目文件索引，参数: {"force": false}，force 为 true 时重新扫描',
+                function=self.build_repo_index,
+            ),
+            "inspect_repo": ToolSpec(
+                name="inspect_repo",
+                description="生成紧凑项目概览，无需参数；自动读取或构建项目索引",
+                function=self.inspect_repo,
             ),
             "propose_patch": ToolSpec(
                 name="propose_patch",
@@ -183,8 +217,12 @@ class RepositoryTools:
             raise ToolError(f"path 不是文件: {self._format_repo_path(target_file)}")
 
         file_size = target_file.stat().st_size
-        if file_size > MAX_FILE_BYTES:
-            raise ToolError(f"文件超过 20KB 限制: {path}")
+        if file_size > MAX_FULL_READ_BYTES:
+            raise ToolError(
+                "文件超过 read_file 完整读取字节阈值，"
+                f"请改用 read_file_range；当前 {file_size} bytes，"
+                f"阈值 {MAX_FULL_READ_BYTES} bytes，行阈值 {MAX_FULL_READ_LINES} 行"
+            )
 
         self._validate_readable_file(target_file)
 
@@ -193,7 +231,15 @@ class RepositoryTools:
         except UnicodeDecodeError as error:
             raise ToolError(f"文件不是有效的 UTF-8 文本: {path}") from error
 
-        return "\n".join(self._format_numbered_lines(file_text.splitlines(), start_line=1))
+        file_lines = file_text.splitlines()
+        if len(file_lines) > MAX_FULL_READ_LINES:
+            raise ToolError(
+                "文件超过 read_file 完整读取行数阈值，"
+                f"请改用 read_file_range；当前 {len(file_lines)} 行，"
+                f"行阈值 {MAX_FULL_READ_LINES} 行，字节阈值 {MAX_FULL_READ_BYTES} bytes"
+            )
+
+        return "\n".join(self._format_numbered_lines(file_lines, start_line=1))
 
     def read_file_range(self, path: str, start_line: int, end_line: int) -> str:
         """读取 repo 内 UTF-8 文本文件的闭区间行范围。
@@ -215,35 +261,56 @@ class RepositoryTools:
             raise ToolError("start_line 必须大于等于 1")
         if end_line < start_line:
             raise ToolError("end_line 必须大于等于 start_line")
+        requested_line_count = end_line - start_line + 1
+        if requested_line_count > MAX_RANGE_READ_LINES:
+            raise ToolError(
+                f"read_file_range 单次最多读取 {MAX_RANGE_READ_LINES} 行，"
+                f"当前请求 {requested_line_count} 行"
+            )
 
         target_file = self._resolve_repo_path(path)
         if not target_file.is_file():
             raise ToolError(f"path 不是文件: {self._format_repo_path(target_file)}")
 
-        file_size = target_file.stat().st_size
-        if file_size > MAX_FILE_BYTES:
-            raise ToolError(f"文件超过 20KB 限制: {path}")
-
         self._validate_readable_file(target_file)
 
         try:
-            file_lines = target_file.read_text(encoding="utf-8").splitlines()
+            selected_lines: list[str] = []
+            last_line_number = 0
+            with target_file.open("r", encoding="utf-8") as file_stream:
+                for line_number, raw_line in enumerate(file_stream, start=1):
+                    last_line_number = line_number
+                    if line_number < start_line:
+                        continue
+                    if line_number > end_line:
+                        break
+                    selected_lines.append(raw_line.rstrip("\r\n"))
         except UnicodeDecodeError as error:
             raise ToolError(f"文件不是有效的 UTF-8 文本: {path}") from error
 
-        if start_line > len(file_lines):
-            return ""
+        if end_line > last_line_number:
+            raise ToolError(
+                f"end_line 超过文件总行数: {end_line} > {last_line_number}"
+            )
 
-        selected_lines = file_lines[start_line - 1:end_line]
         return "\n".join(
             self._format_numbered_lines(selected_lines, start_line=start_line)
         )
 
-    def search_text(self, keyword: str) -> list[str]:
+    def search_text(
+        self,
+        keyword: str,
+        path_glob: str | None = None,
+        max_results: int = MAX_SEARCH_RESULTS,
+        context_lines: int = 2,
+    ) -> list[str]:
         """在 repo 内搜索关键字。
 
         Args:
             keyword: 要搜索的关键字。
+            path_glob: 可选 repo 相对路径 glob。
+            max_results: 最大返回命中数。
+            context_lines: 命中行上下文行数。
 
         Returns:
             命中列表，包含文件名、行号和附近带行号代码片段。
@@ -252,9 +319,15 @@ class RepositoryTools:
         normalized_keyword = keyword.strip()
         if not normalized_keyword:
             raise ToolError("keyword 不能为空")
+        normalized_path_glob = self._normalize_search_path_glob(path_glob)
+        normalized_max_results = self._normalize_search_max_results(max_results)
+        normalized_context_lines = self._normalize_search_context_lines(context_lines)
 
         matches: list[str] = []
+        output_chars = 0
         for file_path in self._iter_searchable_files():
+            if not self._matches_search_path_glob(file_path, normalized_path_glob):
+                continue
             lines = self._read_text_lines(file_path)
             if lines is None:
                 continue
@@ -263,23 +336,96 @@ class RepositoryTools:
                 if normalized_keyword not in line_text:
                     continue
 
-                snippet_start = max(line_number - 2, 1)
-                snippet_end = min(line_number + 2, len(lines))
+                snippet_start = max(line_number - normalized_context_lines, 1)
+                snippet_end = min(line_number + normalized_context_lines, len(lines))
                 snippet_lines = lines[snippet_start - 1:snippet_end]
                 formatted_snippet = self._format_numbered_lines(
                     snippet_lines,
                     start_line=snippet_start,
                 )
-                matches.append(
-                    "\n".join(
-                        [
-                            f"{self._format_repo_path(file_path)}:{line_number}",
-                            *formatted_snippet,
-                        ]
-                    )
+                formatted_match = "\n".join(
+                    [
+                        f"{self._format_repo_path(file_path)}:{line_number}",
+                        *formatted_snippet,
+                    ]
                 )
+                next_output_chars = output_chars + len(formatted_match)
+                if next_output_chars > MAX_TOOL_OUTPUT_CHARS:
+                    self._append_search_truncation_marker(matches)
+                    return matches
+                matches.append(formatted_match)
+                output_chars = next_output_chars
+                if len(matches) >= normalized_max_results:
+                    return matches
 
         return matches
+
+    def build_repo_index(self, force: bool = False) -> dict[str, object]:
+        """构建或读取 repo 文件索引。"""
+
+        if not isinstance(force, bool):
+            raise ToolError("force 必须是布尔值")
+
+        repo_id = hashlib.sha256(str(self.repo_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        index_path = self.repopilot_root / "index" / repo_id / "file_index.json"
+        if not force and index_path.is_file():
+            cached_index = self._read_repo_index(index_path)
+            files = cached_index.get("files", [])
+            file_count = len(files) if isinstance(files, list) else 0
+            return {
+                "ok": True,
+                "status": "cached",
+                "repo_id": repo_id,
+                "index_path": self._format_repo_path(index_path),
+                "file_count": file_count,
+            }
+
+        file_records = [
+            self._build_repo_index_file_record(file_path)
+            for file_path in self._iter_repo_index_files()
+        ]
+        repo_index = {
+            "repo_id": repo_id,
+            "files": file_records,
+        }
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps(repo_index, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {
+            "ok": True,
+            "status": "built",
+            "repo_id": repo_id,
+            "index_path": self._format_repo_path(index_path),
+            "file_count": len(file_records),
+        }
+
+    def inspect_repo(self) -> dict[str, object]:
+        """返回基于项目索引的紧凑项目概览。"""
+
+        index_result = self.build_repo_index(force=False)
+        index_path = self.repo_root / str(index_result["index_path"])
+        repo_index = self._read_repo_index(index_path)
+        file_records = self._get_repo_index_file_records(repo_index)
+        python_file_records = [
+            file_record
+            for file_record in file_records
+            if file_record.get("extension") == ".py"
+        ]
+
+        overview: dict[str, object] = {
+            "ok": True,
+            "index_status": index_result["status"],
+            "index_path": index_result["index_path"],
+            "file_count": len(file_records),
+            "python_file_count": len(python_file_records),
+            "main_python_modules": self._select_main_python_modules(python_file_records),
+            "test_files": self._select_test_files(file_records),
+            "entrypoint_candidates": self._select_entrypoint_candidates(python_file_records),
+            "large_files": self._select_large_files(file_records),
+        }
+        return self._fit_inspect_repo_output(overview)
 
     def propose_patch(
         self,
@@ -1131,6 +1277,271 @@ class RepositoryTools:
 
         return sorted(searchable_files, key=lambda item: self._format_repo_path(item).lower())
 
+    def _iter_repo_index_files(self) -> list[Path]:
+        indexed_files: list[Path] = []
+        for current_dir, dir_names, file_names in os.walk(self.repo_root, topdown=True):
+            dir_names[:] = [
+                dir_name
+                for dir_name in dir_names
+                if dir_name not in REPO_INDEX_SKIPPED_DIR_NAMES
+            ]
+
+            current_dir_path = Path(current_dir)
+            for file_name in file_names:
+                file_path = current_dir_path / file_name
+                try:
+                    file_path.resolve().relative_to(self.repo_root)
+                except (OSError, ValueError):
+                    continue
+                indexed_files.append(file_path)
+
+        return sorted(indexed_files, key=lambda item: self._format_repo_path(item).lower())
+
+    def _build_repo_index_file_record(self, file_path: Path) -> dict[str, object]:
+        file_record: dict[str, object] = {
+            "path": self._format_repo_path(file_path),
+            "size_bytes": 0,
+            "line_count": 0,
+            "extension": file_path.suffix.lower(),
+            "symbols": [],
+        }
+
+        try:
+            file_record["size_bytes"] = file_path.stat().st_size
+            file_text = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            file_record["error"] = f"decode error: {error}"
+            return file_record
+        except OSError as error:
+            file_record["error"] = f"os error: {error}"
+            return file_record
+
+        file_record["line_count"] = len(file_text.splitlines())
+        if file_path.suffix.lower() != ".py":
+            return file_record
+
+        try:
+            parsed_module = ast.parse(file_text, filename=self._format_repo_path(file_path))
+        except SyntaxError as error:
+            file_record["error"] = f"syntax error: {error.msg}"
+            return file_record
+
+        file_record["symbols"] = self._extract_python_symbols(parsed_module)
+        if self._has_python_main_guard(parsed_module):
+            file_record["entrypoint_evidence"] = ["main_guard"]
+        return file_record
+
+    def _extract_python_symbols(self, parsed_module: ast.Module) -> list[dict[str, object]]:
+        symbols: list[dict[str, object]] = []
+        for statement in parsed_module.body:
+            if isinstance(statement, ast.ClassDef):
+                symbols.append({"name": statement.name, "kind": "class", "line": statement.lineno})
+                symbols.extend(self._extract_python_method_symbols(statement))
+            elif isinstance(statement, ast.AsyncFunctionDef):
+                symbols.append({"name": statement.name, "kind": "async_function", "line": statement.lineno})
+            elif isinstance(statement, ast.FunctionDef):
+                symbols.append({"name": statement.name, "kind": "function", "line": statement.lineno})
+        return symbols
+
+    def _extract_python_method_symbols(self, class_node: ast.ClassDef) -> list[dict[str, object]]:
+        method_symbols: list[dict[str, object]] = []
+        for statement in class_node.body:
+            if isinstance(statement, ast.AsyncFunctionDef):
+                method_symbols.append({"name": statement.name, "kind": "async_method", "line": statement.lineno})
+            elif isinstance(statement, ast.FunctionDef):
+                method_symbols.append({"name": statement.name, "kind": "method", "line": statement.lineno})
+        return method_symbols
+
+    def _has_python_main_guard(self, parsed_module: ast.Module) -> bool:
+        for statement in parsed_module.body:
+            if isinstance(statement, ast.If) and self._is_python_main_guard_test(statement.test):
+                return True
+        return False
+
+    def _is_python_main_guard_test(self, test_node: ast.expr) -> bool:
+        if not isinstance(test_node, ast.Compare):
+            return False
+        if len(test_node.ops) != 1 or not isinstance(test_node.ops[0], ast.Eq):
+            return False
+        if len(test_node.comparators) != 1:
+            return False
+        left_text = self._main_guard_literal(test_node.left)
+        right_text = self._main_guard_literal(test_node.comparators[0])
+        return {left_text, right_text} == {"__name__", "__main__"}
+
+    def _main_guard_literal(self, node: ast.expr) -> str:
+        if isinstance(node, ast.Name) and node.id == "__name__":
+            return "__name__"
+        if isinstance(node, ast.Constant) and node.value == "__main__":
+            return "__main__"
+        return ""
+
+    def _get_repo_index_file_records(self, repo_index: dict[str, object]) -> list[dict[str, object]]:
+        files = repo_index.get("files", [])
+        if not isinstance(files, list):
+            raise ToolError("项目索引 files 必须是列表")
+        return [file_record for file_record in files if isinstance(file_record, dict)]
+
+    def _select_main_python_modules(self, file_records: list[dict[str, object]]) -> list[dict[str, object]]:
+        ranked_records = sorted(
+            file_records,
+            key=lambda file_record: (
+                -self._symbol_count(file_record),
+                -self._int_record_value(file_record, "size_bytes"),
+                str(file_record.get("path", "")),
+            ),
+        )
+        return [self._compact_python_record(file_record) for file_record in ranked_records[:10]]
+
+    def _select_test_files(self, file_records: list[dict[str, object]]) -> list[dict[str, object]]:
+        test_records = [
+            file_record
+            for file_record in file_records
+            if self._is_test_file_record(file_record)
+        ]
+        ranked_records = sorted(test_records, key=lambda file_record: str(file_record.get("path", "")))
+        return [self._compact_file_record(file_record) for file_record in ranked_records[:10]]
+
+    def _select_entrypoint_candidates(self, file_records: list[dict[str, object]]) -> list[dict[str, object]]:
+        entrypoint_records = [
+            file_record
+            for file_record in file_records
+            if self._is_entrypoint_candidate(file_record)
+        ]
+        ranked_records = sorted(
+            entrypoint_records,
+            key=lambda file_record: (
+                -len(self._entrypoint_reasons(file_record)),
+                str(file_record.get("path", "")),
+            ),
+        )
+        return [
+            {
+                **self._compact_python_record(file_record),
+                "reasons": self._entrypoint_reasons(file_record),
+            }
+            for file_record in ranked_records[:10]
+        ]
+
+    def _select_large_files(self, file_records: list[dict[str, object]]) -> list[dict[str, object]]:
+        ranked_records = sorted(
+            file_records,
+            key=lambda file_record: (
+                -self._int_record_value(file_record, "size_bytes"),
+                str(file_record.get("path", "")),
+            ),
+        )
+        return [self._compact_large_file_record(file_record) for file_record in ranked_records[:10]]
+
+    def _compact_python_record(self, file_record: dict[str, object]) -> dict[str, object]:
+        compact_record = self._compact_file_record(file_record)
+        compact_record["symbol_count"] = self._symbol_count(file_record)
+        return compact_record
+
+    def _compact_file_record(self, file_record: dict[str, object]) -> dict[str, object]:
+        return {
+            "path": str(file_record.get("path", "")),
+            "size_bytes": self._int_record_value(file_record, "size_bytes"),
+            "line_count": self._int_record_value(file_record, "line_count"),
+        }
+
+    def _compact_large_file_record(self, file_record: dict[str, object]) -> dict[str, object]:
+        size_bytes = self._int_record_value(file_record, "size_bytes")
+        line_count = self._int_record_value(file_record, "line_count")
+        return {
+            "path": str(file_record.get("path", "")),
+            "size_bytes": size_bytes,
+            "line_count": line_count,
+            "exceeds_full_read_threshold": size_bytes > MAX_FULL_READ_BYTES or line_count > MAX_FULL_READ_LINES,
+            "exceeds_bytes_threshold": size_bytes > MAX_FULL_READ_BYTES,
+            "exceeds_lines_threshold": line_count > MAX_FULL_READ_LINES,
+        }
+
+    def _is_test_file_record(self, file_record: dict[str, object]) -> bool:
+        path_text = str(file_record.get("path", ""))
+        path_lower = path_text.lower()
+        return "test" in path_lower or Path(path_text).name.startswith("test_")
+
+    def _is_entrypoint_candidate(self, file_record: dict[str, object]) -> bool:
+        return bool(self._entrypoint_reasons(file_record))
+
+    def _entrypoint_reasons(self, file_record: dict[str, object]) -> list[str]:
+        path_text = str(file_record.get("path", ""))
+        file_name = Path(path_text).name
+        reasons: list[str] = []
+        if file_name in {"main.py", "app.py"}:
+            reasons.append("filename")
+        if file_name.startswith("run_") and file_name.endswith(".py"):
+            reasons.append("run_filename")
+        if self._has_symbol_named(file_record, "main"):
+            reasons.append("main_symbol")
+        evidence = file_record.get("entrypoint_evidence", [])
+        if isinstance(evidence, list) and "main_guard" in evidence:
+            reasons.append("main_guard")
+        return reasons
+
+    def _has_symbol_named(self, file_record: dict[str, object], symbol_name: str) -> bool:
+        symbols = file_record.get("symbols", [])
+        if not isinstance(symbols, list):
+            return False
+        return any(
+            isinstance(symbol, dict) and symbol.get("name") == symbol_name
+            for symbol in symbols
+        )
+
+    def _symbol_count(self, file_record: dict[str, object]) -> int:
+        symbols = file_record.get("symbols", [])
+        if not isinstance(symbols, list):
+            return 0
+        return len(symbols)
+
+    def _int_record_value(self, file_record: dict[str, object], key: str) -> int:
+        value = file_record.get(key, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def _fit_inspect_repo_output(self, overview: dict[str, object]) -> dict[str, object]:
+        if self._inspect_repo_output_fits(overview):
+            return overview
+        compact_overview = dict(overview)
+        list_keys = (
+            "main_python_modules",
+            "test_files",
+            "entrypoint_candidates",
+            "large_files",
+        )
+        for list_key in list_keys:
+            list_value = compact_overview.get(list_key, [])
+            compact_overview[list_key] = list_value if isinstance(list_value, list) else []
+        compact_overview["truncated"] = True
+        max_list_items = 0
+        for list_key in list_keys:
+            list_value = compact_overview[list_key]
+            if isinstance(list_value, list):
+                max_list_items = max(max_list_items, len(list_value))
+        for item_limit in range(max_list_items, -1, -1):
+            for list_key in list_keys:
+                list_value = compact_overview[list_key]
+                compact_overview[list_key] = list_value[:item_limit] if isinstance(list_value, list) else []
+            if self._inspect_repo_output_fits(compact_overview):
+                return compact_overview
+        compact_overview["index_path"] = ""
+        if self._inspect_repo_output_fits(compact_overview):
+            return compact_overview
+        return compact_overview
+
+    def _inspect_repo_output_fits(self, overview: dict[str, object]) -> bool:
+        serialized_overview = json.dumps(overview, ensure_ascii=False, sort_keys=True)
+        return len(serialized_overview) <= MAX_TOOL_OUTPUT_CHARS
+
+    def _read_repo_index(self, index_path: Path) -> dict[str, object]:
+        try:
+            repo_index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ToolError(f"读取项目索引失败: {self._format_repo_path(index_path)}") from error
+        if not isinstance(repo_index, dict):
+            raise ToolError("项目索引必须是 JSON 对象")
+        return repo_index
+
     def _should_skip_dir(self, dir_name: str) -> bool:
         return dir_name.startswith(".") or dir_name in SKIPPED_DIR_NAMES
 
@@ -1158,6 +1569,41 @@ class RepositoryTools:
             return file_path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             return None
+
+    def _normalize_search_path_glob(self, path_glob: str | None) -> str | None:
+        if path_glob is None:
+            return None
+        if not isinstance(path_glob, str) or not path_glob.strip():
+            raise ToolError("path_glob 必须是非空字符串或 null")
+        if Path(path_glob).is_absolute() or ".." in Path(path_glob).parts:
+            raise ToolError("path_glob 必须是 repo 内相对 glob")
+        return path_glob.strip().replace("\\", "/")
+
+    def _normalize_search_max_results(self, max_results: int) -> int:
+        if not isinstance(max_results, int) or isinstance(max_results, bool):
+            raise ToolError("max_results 必须是整数")
+        if max_results < 1:
+            raise ToolError("max_results 必须大于等于 1")
+        if max_results > MAX_SEARCH_RESULTS:
+            raise ToolError(f"max_results 不能超过 {MAX_SEARCH_RESULTS}")
+        return max_results
+
+    def _normalize_search_context_lines(self, context_lines: int) -> int:
+        if not isinstance(context_lines, int) or isinstance(context_lines, bool):
+            raise ToolError("context_lines 必须是整数")
+        if context_lines < 0:
+            raise ToolError("context_lines 必须大于等于 0")
+        return context_lines
+
+    def _matches_search_path_glob(self, file_path: Path, path_glob: str | None) -> bool:
+        if path_glob is None:
+            return True
+        repo_path = self._format_repo_path(file_path)
+        return Path(repo_path).match(path_glob)
+
+    def _append_search_truncation_marker(self, matches: list[str]) -> None:
+        if not matches or matches[-1] != "...（结果已截断）":
+            matches.append("...（结果已截断）")
 
     def _format_numbered_lines(self, lines: list[str], start_line: int) -> list[str]:
         return [

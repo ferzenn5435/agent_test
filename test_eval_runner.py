@@ -819,6 +819,196 @@ class TestEditEvalRunner(unittest.TestCase):
         return tuple(sorted(snapshots))
 
 
+class TestContextEvalV05(unittest.TestCase):
+    """验证 v0.5 context 约束会进入 edit eval 判定。"""
+
+    def setUp(self) -> None:
+        self.project_root = Path(__file__).resolve().parent
+
+    def _case(
+        self,
+        case_id: str,
+        must_not_read_full_files: tuple[str, ...] = (),
+        max_total_tool_output_chars: int | None = None,
+    ) -> EditEvalCase:
+        return EditEvalCase(
+            id=case_id,
+            fixture="tests/fixtures/simple_python_project",
+            prompt=f"执行 {case_id}",
+            max_steps=4,
+            allowed_changed_files=(),
+            must_contain=(),
+            must_not_read_full_files=must_not_read_full_files,
+            max_total_tool_output_chars=max_total_tool_output_chars,
+        )
+
+    def _write_cases(self, cases: list[dict[str, object]]) -> Path:
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        cases_path = Path(temp_directory.name) / "edit_cases.json"
+        cases_path.write_text(json.dumps(cases, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cases_path
+
+    def test_must_not_read_full_files_fails_case(self) -> None:
+        case = self._case(
+            case_id="forbidden-full-read",
+            must_not_read_full_files=("README.md",),
+        )
+        fake_llm = FakeLlmClient(
+            [
+                _tool_call("read_file", {"path": "README.md"}),
+                _tool_call("finish", {"answer": "README.md 已读取。"}),
+            ]
+        )
+
+        eval_result = run_edit_case(case, self.project_root, lambda _case: fake_llm)
+
+        self.assertFalse(eval_result.passed)
+        self.assertIsNotNone(eval_result.context_stats)
+        assert eval_result.context_stats is not None
+        self.assertEqual(["README.md"], eval_result.context_stats["full_file_reads"])
+        self.assertTrue(
+            any(
+                "must_not_read_full_files" in reason
+                and "README.md" in reason
+                and "actual_full_file_reads" in reason
+                for reason in eval_result.reasons
+            ),
+            eval_result.reasons,
+        )
+
+    def test_max_total_tool_output_chars_fails_case(self) -> None:
+        case = self._case(
+            case_id="output-budget",
+            max_total_tool_output_chars=1,
+        )
+        fake_llm = FakeLlmClient(
+            [_tool_call("finish", {"answer": "无需修改。"})]
+        )
+
+        eval_result = run_edit_case(case, self.project_root, lambda _case: fake_llm)
+
+        self.assertFalse(eval_result.passed)
+        self.assertIsNotNone(eval_result.context_stats)
+        assert eval_result.context_stats is not None
+        actual_chars = eval_result.context_stats["total_tool_output_chars"]
+        self.assertIsInstance(actual_chars, int)
+        self.assertGreater(actual_chars, 1)
+        self.assertTrue(
+            any(
+                "max_total_tool_output_chars" in reason
+                and "limit=1" in reason
+                and f"actual={actual_chars}" in reason
+                for reason in eval_result.reasons
+            ),
+            eval_result.reasons,
+        )
+
+    def test_context_stats_included_in_successful_result(self) -> None:
+        case = self._case(case_id="context-stats-included")
+        fake_llm = FakeLlmClient(
+            [_tool_call("finish", {"answer": "无需修改。"})]
+        )
+
+        eval_result = run_edit_case(case, self.project_root, lambda _case: fake_llm)
+
+        self.assertTrue(eval_result.passed, eval_result.reasons)
+        self.assertIsNotNone(eval_result.context_stats)
+        assert eval_result.context_stats is not None
+        self.assertEqual(1, eval_result.context_stats["steps_used"])
+        self.assertIn("total_tool_output_chars", eval_result.context_stats)
+
+    def test_loads_valid_context_fields(self) -> None:
+        cases_path = self._write_cases(
+            [
+                {
+                    "id": "context-fields",
+                    "fixture": "tests/fixtures/simple_python_project",
+                    "prompt": "validate context fields",
+                    "allowed_changed_files": [],
+                    "must_contain": [],
+                    "must_not_read_full_files": ["docs\\guide.md", "src/main.py"],
+                    "max_total_tool_output_chars": 123,
+                }
+            ]
+        )
+
+        cases = load_edit_cases(cases_path)
+
+        self.assertEqual(("docs/guide.md", "src/main.py"), cases[0].must_not_read_full_files)
+        self.assertEqual(123, cases[0].max_total_tool_output_chars)
+
+    def test_loads_context_cases(self) -> None:
+        cases_path = self.project_root / "eval_cases" / "context_cases.json"
+
+        cases = load_edit_cases(cases_path)
+        cases_by_id = {case.id: case for case in cases}
+
+        self.assertEqual(
+            {"avoid-large-unrelated-file", "edit-targeted-file-with-context-budget"},
+            set(cases_by_id),
+        )
+        avoid_large_case = cases_by_id["avoid-large-unrelated-file"]
+        self.assertEqual("tests/fixtures/medium_python_project", avoid_large_case.fixture)
+        self.assertEqual(("large_notes.md",), avoid_large_case.must_not_read_full_files)
+        self.assertEqual(12000, avoid_large_case.max_total_tool_output_chars)
+        self.assertEqual((), avoid_large_case.allowed_changed_files)
+        self.assertEqual((), avoid_large_case.must_contain)
+
+        targeted_edit_case = cases_by_id["edit-targeted-file-with-context-budget"]
+        self.assertEqual(("app/services.py",), targeted_edit_case.allowed_changed_files)
+        self.assertEqual(("large_notes.md",), targeted_edit_case.must_not_read_full_files)
+        self.assertEqual(12000, targeted_edit_case.max_total_tool_output_chars)
+        self.assertEqual("unit", targeted_edit_case.test_command)
+        self.assertEqual(1, len(targeted_edit_case.must_contain))
+        self.assertEqual("app/services.py", targeted_edit_case.must_contain[0].path)
+        self.assertEqual(
+            ("label=invoice", "build_invoice_summary"),
+            targeted_edit_case.must_contain[0].strings,
+        )
+
+    def test_rejects_invalid_context_field_types(self) -> None:
+        invalid_cases = [
+            {
+                "id": "bad-forbidden-type",
+                "fixture": "tests/fixtures/simple_python_project",
+                "prompt": "bad forbidden",
+                "allowed_changed_files": [],
+                "must_contain": [],
+                "must_not_read_full_files": "README.md",
+            },
+            {
+                "id": "bad-forbidden-path",
+                "fixture": "tests/fixtures/simple_python_project",
+                "prompt": "bad path",
+                "allowed_changed_files": [],
+                "must_contain": [],
+                "must_not_read_full_files": ["../README.md"],
+            },
+            {
+                "id": "bad-budget-bool",
+                "fixture": "tests/fixtures/simple_python_project",
+                "prompt": "bad budget bool",
+                "allowed_changed_files": [],
+                "must_contain": [],
+                "max_total_tool_output_chars": True,
+            },
+            {
+                "id": "bad-budget-zero",
+                "fixture": "tests/fixtures/simple_python_project",
+                "prompt": "bad budget zero",
+                "allowed_changed_files": [],
+                "must_contain": [],
+                "max_total_tool_output_chars": 0,
+            },
+        ]
+        for raw_case in invalid_cases:
+            with self.subTest(case_id=raw_case["id"]):
+                cases_path = self._write_cases([raw_case])
+                with self.assertRaises(EditEvalConfigError):
+                    load_edit_cases(cases_path)
+
+
 class TestRunEditEvalCli(unittest.TestCase):
     """验证 edit eval CLI 摘要输出与结果持久化。"""
 
@@ -996,6 +1186,83 @@ class TestReadmeV04Docs(unittest.TestCase):
                 self.assertNotIn(forbidden_text, self.readme_text)
         self.assertIn("no arbitrary shell", self.readme_text)
         self.assertIn("no framework", self.readme_text)
+
+
+class TestReadmeV05Docs(unittest.TestCase):
+    """验证 README 记录 v0.5 上下文管理、项目索引和边界约束。"""
+
+    def setUp(self) -> None:
+        project_root = Path(__file__).resolve().parent
+        self.readme_text = (project_root / "README.md").read_text(encoding="utf-8")
+
+    def test_documents_v05_section_and_index_tools(self) -> None:
+        for expected_text in [
+            "## v0.5 上下文管理与项目索引",
+            "`build_repo_index(force=False)`",
+            ".repopilot/index/<repo_id>/file_index.json",
+            "`inspect_repo()`",
+            "紧凑项目概览",
+            "项目分析、定位入口或准备修改代码时优先使用它",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_documents_read_search_thresholds(self) -> None:
+        for expected_text in [
+            "MAX_FULL_READ_LINES=300",
+            "MAX_FULL_READ_BYTES=20_000",
+            "MAX_RANGE_READ_LINES=120",
+            "MAX_TOOL_OUTPUT_CHARS=12_000",
+            "MAX_SEARCH_RESULTS=20",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_documents_context_stats_schema(self) -> None:
+        for expected_text in [
+            "ContextStats",
+            "`steps_used`",
+            "`total_tool_output_chars`",
+            "`messages_total_chars`",
+            "`files_read`",
+            "`ranges_read`",
+            "`search_calls`",
+            "`full_file_reads`",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_documents_edit_and_context_eval_commands(self) -> None:
+        for expected_text in [
+            "python run_edit_eval.py --cases eval_cases/edit_cases.json",
+            "python run_edit_eval.py --cases eval_cases/context_cases.json",
+            "CLI 会记录结构化结果和上下文违规原因",
+            "不承诺每次都通过",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_documents_forbidden_frameworks_and_shell_boundaries(self) -> None:
+        for expected_text in [
+            "不使用 LangChain、LangGraph、LlamaIndex、MCP 或 vector DB",
+            "不提供 arbitrary shell",
+            "不加入语义搜索、外部 agent 框架或联网协作",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+        for forbidden_text in [
+            "可使用 LangChain",
+            "可使用 LangGraph",
+            "可使用 LlamaIndex",
+            "可使用 MCP",
+            "可使用 vector DB",
+            "可提供 arbitrary shell",
+            "支持任意 shell",
+            "真实 LLM context cases always pass",
+        ]:
+            with self.subTest(forbidden_text=forbidden_text):
+                self.assertNotIn(forbidden_text, self.readme_text)
 
 
 if __name__ == "__main__":

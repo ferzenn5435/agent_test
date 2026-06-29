@@ -1,0 +1,28 @@
+[
+  {
+    "id": "avoid-large-unrelated-file",
+    "fixture": "tests/fixtures/medium_python_project",
+    "prompt": "找出发票摘要相关代码的位置，并说明不要完整读取无关的大型笔记文件。",
+    "max_steps": 5,
+    "allowed_changed_files": [],
+    "must_contain": [],
+    "must_not_read_full_files": ["large_notes.md"],
+    "max_total_tool_output_chars": 12000
+  },
+  {
+    "id": "edit-targeted-file-with-context-budget",
+    "fixture": "tests/fixtures/medium_python_project",
+    "prompt": "只修改 app/services.py，让 build_invoice_summary 返回的摘要包含精确标记 label=invoice，同时保持测试通过。不要完整读取 large_notes.md。",
+    "max_steps": 7,
+    "allowed_changed_files": ["app/services.py"],
+    "must_contain": [
+      {
+        "path": "app/services.py",
+        "strings": ["label=invoice", "build_invoice_summary"]
+      }
+    ],
+    "must_not_read_full_files": ["large_notes.md"],
+    "max_total_tool_output_chars": 12000,
+    "test_command": "unit"
+  }
+]
