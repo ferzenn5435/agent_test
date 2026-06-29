@@ -49,6 +49,7 @@ logs/**/*.log
 .tmp/
 tmp/
 temp/
+.repopilot/
 
 # Jupyter
 .ipynb_checkpoints/

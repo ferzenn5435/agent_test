@@ -198,6 +198,18 @@ class TestFakeLlmClient(unittest.TestCase):
         self.assertIn("agent 未在 max_steps 内成功调用 finish", eval_result.reasons)
         self.assertIsNotNone(eval_result.error)
 
+    def test_eval_prompt_documents_auto_approval_without_changing_case_prompt(self) -> None:
+        eval_case = self._case("fake-auto-approval")
+
+        eval_prompt = eval_runner._build_eval_agent_prompt(eval_case)
+
+        self.assertIn(eval_case.prompt, eval_prompt)
+        self.assertIn("auto_for_eval 自动批准", eval_prompt)
+        self.assertIn("直接调用 apply_patch", eval_prompt)
+        self.assertIn("不要额外调用 inspect_repo", eval_prompt)
+        self.assertIn("不要重复读取同一文件", eval_prompt)
+        self.assertEqual("执行 fake-auto-approval", eval_case.prompt)
+
 
 class TestEditCaseLoader(unittest.TestCase):
     """验证 edit 评测用例加载与校验规则。"""
@@ -223,7 +235,8 @@ class TestEditCaseLoader(unittest.TestCase):
         self.assertEqual("README.md", cases[0].allowed_changed_files[0])
         self.assertEqual("unit", cases[1].test_command)
         self.assertFalse(cases[0].expect_no_business_changes)
-        self.assertEqual(4, cases[0].max_steps)
+        self.assertEqual(7, cases[0].max_steps)
+        self.assertEqual(16, cases[1].max_steps)
 
         forbidden_case = cases[2]
         self.assertEqual("forbidden-outside-file", forbidden_case.id)

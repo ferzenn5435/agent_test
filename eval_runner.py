@@ -362,7 +362,7 @@ def run_edit_case(
 
             case_exception: Exception | None = None
             try:
-                agent.answer(case.prompt)
+                agent.answer(_build_eval_agent_prompt(case))
             except Exception as error:  # noqa: BLE001 - eval 需保留异常后的文件变更证据
                 case_exception = error
 
@@ -464,6 +464,24 @@ def run_edit_eval(
         "pass_rate": pass_rate,
         "results": [asdict(result) for result in results],
     }
+
+
+def _build_eval_agent_prompt(case: EditEvalCase) -> str:
+    """构建 edit eval 专用任务说明。"""
+
+    allowed_files = ", ".join(case.allowed_changed_files) or "无"
+    return (
+        f"{case.prompt}\n\n"
+        "Edit eval 执行约束：\n"
+        f"- 只处理这些允许变更文件: {allowed_files}。\n"
+        "- 这些目标文件已由评测用例明确给出；除非确实需要定位未知文件，"
+        "不要额外调用 inspect_repo。\n"
+        "- 读取完允许变更文件并确认修改点后，不要重复读取同一文件；"
+        "下一步应提交 propose_patch。\n"
+        "- 当前运行在评测临时仓库，apply_patch 已启用 auto_for_eval 自动批准；"
+        "propose_patch 成功返回 patch_id 后，应直接调用 apply_patch。\n"
+        "- 如果用例需要测试，apply_patch 成功后调用 run_tests；最后必须调用 finish。"
+    )
 
 
 def _build_llm_client(

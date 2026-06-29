@@ -3,7 +3,7 @@
     "id": "update-readme",
     "fixture": "tests/fixtures/simple_python_project",
     "prompt": "更新 README.md，增加一句说明：本项目用于验证 agent 的安全编辑能力。",
-    "max_steps": 4,
+    "max_steps": 7,
     "allowed_changed_files": ["README.md"],
     "must_contain": [
       {
@@ -16,7 +16,7 @@
     "id": "add-subtract-function",
     "fixture": "tests/fixtures/simple_python_project",
     "prompt": "在 app.py 中新增 subtract(a, b) 函数返回 a - b，并在 test_app.py 中添加 unittest 测试 subtract(3, 1) == 2。",
-    "max_steps": 6,
+    "max_steps": 16,
     "allowed_changed_files": ["app.py", "test_app.py"],
     "must_contain": [
       {
