@@ -73,6 +73,28 @@ def _finished_state(
     )
 
 
+def _awaiting_approval_state() -> RunState:
+    return RunState(
+        stage="AWAITING_APPROVAL",
+        stage_history=("INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL"),
+        plan=_plan(),
+        execution_steps=("inspect",),
+        changed_files=(),
+        tests_result=None,
+    )
+
+
+def _finished_pending_approval_state() -> RunState:
+    return RunState(
+        stage="FINISH",
+        stage_history=("INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "FINISH"),
+        plan=_plan(),
+        execution_steps=("inspect",),
+        changed_files=(),
+        tests_result=None,
+    )
+
+
 class TestDeterministicVerifier(unittest.TestCase):
     def test_verification_passes_with_default_plan_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -207,6 +229,77 @@ class TestDeterministicVerifier(unittest.TestCase):
             self.assertFalse(result.passed)
             self.assertIn(REASON_PATCH_NOT_CONFIRMED, result.reasons)
             self.assertFalse(result.repairable)
+
+    def test_pending_approval_with_pending_patch_is_successful_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            _write_repo(repo_root)
+            run_state = _awaiting_approval_state()
+
+            result = verify_run_state(
+                run_state,
+                repo_root,
+                pending_patch={
+                    "status": "pending_approval",
+                    "patch_id": "20260630_120000_abcdef123456",
+                    "target_files": [{"path": "app.py", "operation": "modify"}],
+                },
+            )
+
+            self.assertTrue(result.passed, result.output)
+            self.assertEqual((), result.reasons)
+            self.assertNotIn(REASON_NOT_FINISHED, result.reasons)
+            self.assertNotIn(REASON_TESTS_FAILED, result.reasons)
+            self.assertNotIn(REASON_PATCH_NOT_CONFIRMED, result.reasons)
+
+    def test_finished_after_awaiting_approval_with_pending_patch_is_successful_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            _write_repo(repo_root)
+            run_state = _finished_pending_approval_state()
+
+            result = verify_run_state(
+                run_state,
+                repo_root,
+                pending_patch={
+                    "status": "pending_approval",
+                    "patch_id": "20260630_120000_abcdef123456",
+                    "target_files": [{"path": "app.py", "operation": "modify"}],
+                },
+            )
+
+            self.assertTrue(result.passed, result.output)
+            self.assertEqual((), result.reasons)
+            self.assertNotIn(REASON_TESTS_FAILED, result.reasons)
+            self.assertNotIn(REASON_PATCH_NOT_CONFIRMED, result.reasons)
+
+    def test_finished_after_awaiting_approval_with_invalid_pending_patch_uses_normal_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            _write_repo(repo_root)
+            run_state = _finished_pending_approval_state()
+
+            result = verify_run_state(
+                run_state,
+                repo_root,
+                pending_patch={"status": "pending_approval", "patch_id": ""},
+            )
+
+            self.assertFalse(result.passed)
+            self.assertIn(REASON_TESTS_FAILED, result.reasons)
+            self.assertIn(REASON_PATCH_NOT_CONFIRMED, result.reasons)
+
+    def test_awaiting_approval_without_pending_patch_is_not_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            _write_repo(repo_root)
+
+            result = verify_run_state(_awaiting_approval_state(), repo_root)
+
+            self.assertFalse(result.passed)
+            self.assertIn(REASON_NOT_FINISHED, result.reasons)
+            self.assertIn(REASON_TESTS_FAILED, result.reasons)
+            self.assertIn(REASON_PATCH_NOT_CONFIRMED, result.reasons)
 
     def test_context_budget_exceeded_for_full_file_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

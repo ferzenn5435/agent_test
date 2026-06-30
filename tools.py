@@ -148,16 +148,30 @@ class RepositoryTools:
                 name="propose_patch",
                 description=(
                     '提交统一差异补丁草稿，参数: {"instruction": "修改说明", "diff": "unified diff"}，'
-                    '返回: {"ok": bool, "patch_id": str, "patch_path": str, '
-                    '"diff_preview": str, "warnings": list[str], "paths": list[str], '
-                    '"errors": list[str]}'
+                    "保存为 pending_approval，返回字段包括 ok、patch_id、patch_path、diff_preview、"
+                    "warnings、paths、target_files、next_commands、errors"
                 ),
                 function=self.propose_patch,
             ),
             "apply_patch": ToolSpec(
                 name="apply_patch",
-                description='Apply a saved proposed patch, args: {"patch_id": "patch ID"}',
+                description='按 patch_id 确定性应用已保存的 pending_approval 补丁，参数: {"patch_id": "patch ID"}',
                 function=self.apply_patch,
+            ),
+            "list_patches": ToolSpec(
+                name="list_patches",
+                description="List deterministic pending patch records; no arguments",
+                function=self.list_patches,
+            ),
+            "show_patch": ToolSpec(
+                name="show_patch",
+                description='Show saved patch metadata and diff preview, args: {"patch_id": "patch ID", "full": false}',
+                function=self.show_patch,
+            ),
+            "reject_patch": ToolSpec(
+                name="reject_patch",
+                description='Reject a pending patch without modifying files, args: {"patch_id": "patch ID"}',
+                function=self.reject_patch,
             ),
             "run_tests": ToolSpec(
                 name="run_tests",
@@ -431,6 +445,11 @@ class RepositoryTools:
         self,
         instruction: str,
         diff: str,
+        run_id: str = "",
+        task: str = "",
+        summary: str = "",
+        plan_snapshot: object | None = None,
+        risk_level: str = "unknown",
     ) -> dict[str, object]:
         """提交统一差异补丁草稿，不修改目标文件。"""
 
@@ -442,6 +461,8 @@ class RepositoryTools:
             "diff_preview": "",
             "warnings": [],
             "paths": [],
+            "target_files": [],
+            "next_commands": [],
             "errors": errors,
         }
         if errors:
@@ -459,10 +480,21 @@ class RepositoryTools:
         ]
         patch_preview = self._generate_diff_preview(diff)
         patch_id = self._generate_patch_id(instruction=instruction, patch_text=diff)
+        target_files = self._build_patch_target_files(touched_paths)
+        diff_path = self._format_repo_path(self._get_new_patch_file_path(patch_id))
+        diff_bytes = diff.encode("utf-8")
         patch_metadata = self._create_patch_metadata(
             patch_id=patch_id,
             instruction=instruction,
             paths=touched_paths,
+            target_files=target_files,
+            diff_path=diff_path,
+            diff_sha256=hashlib.sha256(diff_bytes).hexdigest(),
+            run_id=run_id,
+            task=task,
+            summary=summary,
+            plan_snapshot=plan_snapshot,
+            risk_level=risk_level,
             warnings=warnings,
         )
 
@@ -474,14 +506,10 @@ class RepositoryTools:
                 patch_id=patch_id,
                 event_type="proposed",
                 status="saved",
-                details={"paths": touched_paths},
+                details={"paths": touched_paths, "target_files": target_files},
             )
         except (OSError, ValueError) as error:
-            if patch_path is not None and patch_path.exists():
-                patch_path.unlink()
-            metadata_path = self._get_patch_metadata_path(patch_id)
-            if metadata_path.exists():
-                metadata_path.unlink()
+            self._remove_patch_storage(patch_id)
             response["errors"] = [f"保存补丁失败: {error}"]
             return response
 
@@ -492,6 +520,12 @@ class RepositoryTools:
             "diff_preview": patch_preview,
             "warnings": warnings,
             "paths": touched_paths,
+            "target_files": target_files,
+            "next_commands": [
+                f"inspect patch {patch_id}",
+                f"approve patch {patch_id}",
+                f"apply patch {patch_id}",
+            ],
             "errors": [],
         }
 
@@ -598,8 +632,94 @@ class RepositoryTools:
 
         return touched_paths
 
+    def list_patches(self) -> dict[str, object]:
+        """List deterministic patch metadata records from the directory storage."""
+
+        patches: list[dict[str, object]] = []
+        for patch_dir in sorted(self.repopilot_patches_dir.iterdir(), key=lambda item: item.name):
+            if not patch_dir.is_dir():
+                continue
+            try:
+                self._validate_patch_id(patch_dir.name)
+                metadata = self._read_new_patch_metadata(patch_dir.name)
+            except (OSError, ToolError):
+                continue
+            patches.append(
+                {
+                    "patch_id": metadata.get("patch_id", patch_dir.name),
+                    "status": metadata.get("status", "unknown"),
+                    "created_at": metadata.get("created_at", ""),
+                    "updated_at": metadata.get("updated_at", ""),
+                    "summary": metadata.get("summary", ""),
+                    "paths": metadata.get("paths", []),
+                    "target_files": metadata.get("target_files", []),
+                    "diff_sha256": metadata.get("diff_sha256", ""),
+                }
+            )
+        return {"ok": True, "patches": patches, "errors": []}
+
+    def show_patch(self, patch_id: str, full: bool = False) -> dict[str, object]:
+        """Return metadata plus a deterministic diff preview or the full diff."""
+
+        response: dict[str, object] = {
+            "ok": False,
+            "patch_id": patch_id if isinstance(patch_id, str) else "",
+            "metadata": {},
+            "diff_preview": "",
+            "diff": "",
+            "full": bool(full),
+            "errors": [],
+        }
+        try:
+            self._validate_patch_id(patch_id)
+            metadata = self._read_new_patch_metadata(patch_id)
+            patch_text = self._read_new_patch_file(patch_id)
+            self.validate_unified_diff(patch_text)
+        except ToolError as error:
+            response["errors"] = [str(error)]
+            return response
+
+        response["ok"] = True
+        response["metadata"] = metadata
+        if full:
+            response["diff"] = patch_text
+        else:
+            response["diff_preview"] = self._generate_diff_preview(patch_text)
+        return response
+
+    def reject_patch(self, patch_id: str) -> dict[str, object]:
+        """Reject a pending patch without touching business files."""
+
+        response: dict[str, object] = {
+            "ok": False,
+            "patch_id": patch_id if isinstance(patch_id, str) else "",
+            "status": "rejected",
+            "errors": [],
+        }
+        try:
+            self._validate_patch_id(patch_id)
+            metadata = self._read_new_patch_metadata(patch_id)
+            self._validate_pending_patch_status(metadata)
+        except ToolError as error:
+            response["errors"] = [str(error)]
+            return response
+
+        rejected_at = datetime.now().astimezone().isoformat()
+        metadata["status"] = "rejected"
+        metadata["rejected_at"] = rejected_at
+        metadata["updated_at"] = rejected_at
+        self._write_patch_metadata(metadata)
+        self._append_run_event(patch_id, "reject", "rejected", {})
+        response["ok"] = True
+        return response
+
+    def apply_pending_patch(self, patch_id: str) -> dict[str, object]:
+        """Compatibility alias for the deterministic pending-approval apply path."""
+
+        return self.apply_patch(patch_id)
+
     def apply_patch(self, patch_id: str) -> dict[str, object]:
-        """Apply a saved proposed patch with backup and rollback."""
+        """Apply a pending patch with deterministic preflight, backup, verification, and rollback."""
 
         response: dict[str, object] = {
             "ok": False,
@@ -608,16 +728,20 @@ class RepositoryTools:
             "modified_files": [],
             "backup_dir": "",
             "new_files": [],
-            "rollback": {"attempted": False, "ok": None, "errors": []},
+            "verification_results": [],
+            "rollback": {"attempted": False, "ok": None, "errors": [], "files": []},
             "errors": [],
         }
 
         try:
             self._validate_patch_id(patch_id)
-            metadata = self._read_patch_metadata(patch_id)
+            metadata = self._read_new_patch_metadata(patch_id)
             self._validate_apply_metadata(patch_id, metadata)
-            patch_text = self._read_patch_file(patch_id)
+            patch_text = self._read_new_patch_file(patch_id)
+            self._validate_patch_diff_sha256(patch_text, metadata)
             touched_paths = self.validate_unified_diff(patch_text)
+            self._validate_apply_target_files(metadata, touched_paths)
+            self._validate_apply_target_file_state(metadata)
             patched_files = self._build_patched_files(patch_text)
         except ToolError as error:
             response["errors"] = [str(error)]
@@ -625,15 +749,14 @@ class RepositoryTools:
 
         backup_dir = self.repopilot_backups_dir / patch_id
         existing_files: list[Path] = []
-        new_files: list[str] = []
+        new_file_paths: list[Path] = []
         for patched_file in patched_files:
-            target_path = patched_file["target_path"]
-            if not isinstance(target_path, Path):
-                raise ToolError("invalid patched target")
+            target_path = self._patched_target_path(patched_file)
             if patched_file["existed_before"]:
                 existing_files.append(target_path)
             else:
-                new_files.append(self._format_repo_path(target_path))
+                new_file_paths.append(target_path)
+        new_files = [self._format_repo_path(target_path) for target_path in new_file_paths]
         response["backup_dir"] = self._format_repo_path(backup_dir)
         response["new_files"] = new_files
         response["modified_files"] = touched_paths
@@ -641,23 +764,33 @@ class RepositoryTools:
         self._append_run_event(patch_id, "apply_start", "started", {"paths": touched_paths})
         written_new_files: list[Path] = []
         written_existing_files: list[Path] = []
+        verification_results: list[dict[str, object]] = []
         try:
             self._backup_existing_files(patch_id, existing_files)
+            self._write_backup_manifest(patch_id, patched_files, metadata)
             for patched_file in patched_files:
-                target_path = patched_file["target_path"]
-                if not isinstance(target_path, Path):
-                    raise ToolError("invalid patched target")
+                target_path = self._patched_target_path(patched_file)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 if patched_file["existed_before"]:
                     written_existing_files.append(target_path)
                 else:
                     written_new_files.append(target_path)
                 target_path.write_text(str(patched_file["content"]), encoding="utf-8")
+            verification_results = self._run_apply_verification(metadata)
+            failed_verifications = [
+                verification_result
+                for verification_result in verification_results
+                if verification_result.get("status") == "failed"
+            ]
+            if failed_verifications:
+                raise ToolError("patch verification failed")
         except (OSError, ToolError) as error:
             rollback_result = self._rollback_patch_apply(patch_id, written_existing_files, written_new_files)
             response["status"] = "failed"
             response["rollback"] = rollback_result
             response["errors"] = [str(error)]
+            response["verification_results"] = verification_results
+            self._mark_patch_apply_failed(patch_id, metadata, touched_paths, new_files, rollback_result, response["verification_results"], str(error))
             self._append_run_event(patch_id, "apply_failure", "failed", {"error": str(error), "rollback": rollback_result})
             return response
 
@@ -668,6 +801,7 @@ class RepositoryTools:
         metadata["modified_files"] = touched_paths
         metadata["backup_dir"] = self._format_repo_path(backup_dir)
         metadata["new_files"] = new_files
+        metadata["verification_results"] = verification_results
         self._write_patch_metadata(metadata)
         self._append_run_event(
             patch_id,
@@ -677,20 +811,159 @@ class RepositoryTools:
         )
         response["ok"] = True
         response["status"] = "applied"
-        response["rollback"] = {"attempted": False, "ok": None, "errors": []}
+        response["verification_results"] = verification_results
+        response["rollback"] = {"attempted": False, "ok": None, "errors": [], "files": []}
         return response
 
     def _validate_apply_metadata(self, patch_id: str, metadata: dict[str, object]) -> None:
         if metadata.get("patch_id") != patch_id:
             raise ToolError("metadata.patch_id does not match patch_id")
+        self._validate_pending_patch_status(metadata)
+        expected_diff_path = self._format_repo_path(self._get_new_patch_file_path(patch_id))
+        if metadata.get("diff_path") != expected_diff_path:
+            raise ToolError("metadata.diff_path does not match patch_id storage path")
+        target_files = metadata.get("target_files")
+        has_target_files = isinstance(target_files, list) and all(
+            isinstance(target_file, dict) and isinstance(target_file.get("path"), str)
+            for target_file in target_files
+        )
+        if not has_target_files:
+            raise ToolError("metadata.target_files must describe patch targets")
+
+    def _validate_pending_patch_status(self, metadata: dict[str, object]) -> None:
         status = metadata.get("status")
         if status == "applied":
             raise ToolError("patch is already applied")
-        if status != "proposed":
-            raise ToolError("only status=proposed patches can be applied")
-        paths = metadata.get("paths")
-        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
-            raise ToolError("metadata.paths must be a list of strings")
+        if status != "pending_approval":
+            raise ToolError("only status=pending_approval patches can be applied or rejected")
+
+    def _validate_patch_diff_sha256(self, patch_text: str, metadata: dict[str, object]) -> None:
+        expected_diff_sha256 = metadata.get("diff_sha256")
+        if not isinstance(expected_diff_sha256, str) or not expected_diff_sha256:
+            raise ToolError("metadata.diff_sha256 must be a non-empty string")
+        actual_diff_sha256 = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+        if actual_diff_sha256 != expected_diff_sha256:
+            raise ToolError("patch.diff sha256 does not match metadata.diff_sha256")
+
+    def _validate_apply_target_files(self, metadata: dict[str, object], touched_paths: list[str]) -> None:
+        target_files = metadata.get("target_files")
+        if not isinstance(target_files, list):
+            raise ToolError("metadata.target_files must be a list")
+        metadata_paths: list[str] = []
+        for target_file in target_files:
+            if not isinstance(target_file, dict) or not isinstance(target_file.get("path"), str):
+                raise ToolError("metadata.target_files must contain path strings")
+            metadata_paths.append(str(target_file["path"]))
+        if set(metadata_paths) != set(touched_paths) or len(metadata_paths) != len(touched_paths):
+            raise ToolError("metadata.target_files paths do not match patch.diff targets")
+
+    def _validate_apply_target_file_state(self, metadata: dict[str, object]) -> None:
+        target_files = metadata.get("target_files")
+        if not isinstance(target_files, list):
+            raise ToolError("metadata.target_files must be a list")
+
+        for target_file in target_files:
+            if not isinstance(target_file, dict):
+                raise ToolError("metadata.target_files entries must be objects")
+            target_path_text = target_file.get("path")
+            if not isinstance(target_path_text, str) or not target_path_text.strip():
+                raise ToolError("metadata.target_files entries must include path")
+            operation = target_file.get("operation")
+            existed_before = target_file.get("existed_before")
+            sha256_before = target_file.get("sha256_before")
+            target_path = self._validate_diff_target_path(target_path_text, must_exist=False)
+
+            if operation == "modify":
+                if existed_before is not True:
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} modify must have existed_before=true")
+                if not isinstance(sha256_before, str) or not sha256_before:
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} modify requires sha256_before")
+                if not target_path.is_file():
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} modify target is missing")
+                current_sha256 = self._sha256_file(target_path)
+                if current_sha256 != sha256_before:
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} sha256_before does not match current file")
+            elif operation == "create":
+                if existed_before is not False:
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} create must have existed_before=false")
+                if sha256_before is not None:
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} create requires sha256_before=null")
+                if target_path.exists():
+                    raise ToolError(f"metadata target state mismatch: {target_path_text} create target already exists")
+            else:
+                raise ToolError(f"metadata target state mismatch: {target_path_text} unsupported operation")
+
+    def _patched_target_path(self, patched_file: dict[str, object]) -> Path:
+        target_path = patched_file.get("target_path")
+        if not isinstance(target_path, Path):
+            raise ToolError("invalid patched target")
+        return target_path
+
+    def _run_apply_verification(self, metadata: dict[str, object]) -> list[dict[str, object]]:
+        command_names = self._extract_plan_test_command_names(metadata.get("plan_snapshot"))
+        if not command_names:
+            return [{"command_name": None, "status": "skipped", "reason": "no test_commands"}]
+
+        verification_results: list[dict[str, object]] = []
+        for command_name in command_names:
+            run_result = self.run_tests(command_name)
+            exit_code = run_result.get("exit_code")
+            timed_out = run_result.get("timed_out")
+            verification_status = "ok" if exit_code == 0 and timed_out is False else "failed"
+            verification_results.append(
+                {
+                    "command_name": command_name,
+                    "status": verification_status,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "stdout": run_result.get("stdout", ""),
+                    "stderr": run_result.get("stderr", ""),
+                }
+            )
+        return verification_results
+
+    def _extract_plan_test_command_names(self, plan_snapshot: object) -> list[str]:
+        if not isinstance(plan_snapshot, dict):
+            return []
+        test_commands = plan_snapshot.get("test_commands")
+        if not isinstance(test_commands, list):
+            return []
+
+        command_names: list[str] = []
+        for test_command in test_commands:
+            if isinstance(test_command, str):
+                command_name = test_command
+            elif isinstance(test_command, dict):
+                raw_command_name = test_command.get("command_name", test_command.get("name"))
+                if not isinstance(raw_command_name, str):
+                    raise ToolError("plan_snapshot.test_commands entries must include command_name")
+                command_name = raw_command_name
+            else:
+                raise ToolError("plan_snapshot.test_commands entries must be strings or objects")
+            command_names.append(self._validate_run_command_name(command_name))
+        return command_names
+
+    def _mark_patch_apply_failed(
+        self,
+        patch_id: str,
+        metadata: dict[str, object],
+        touched_paths: list[str],
+        new_files: list[str],
+        rollback_result: dict[str, object],
+        verification_results: object,
+        error_message: str,
+    ) -> None:
+        failed_at = datetime.now().astimezone().isoformat()
+        metadata["status"] = "failed"
+        metadata["updated_at"] = failed_at
+        metadata["failed_at"] = failed_at
+        metadata["modified_files"] = touched_paths
+        metadata["backup_dir"] = self._format_repo_path(self.repopilot_backups_dir / patch_id)
+        metadata["new_files"] = new_files
+        metadata["rollback"] = rollback_result
+        metadata["verification_results"] = verification_results if isinstance(verification_results, list) else []
+        metadata["failure_error"] = error_message
+        self._write_patch_metadata(metadata)
 
     def _build_patched_files(self, patch_text: str) -> list[dict[str, object]]:
         diff_lines = patch_text.splitlines()
@@ -790,8 +1063,36 @@ class RepositoryTools:
             shutil.copy2(source_path, backup_path)
         return backup_dir
 
+    def _write_backup_manifest(
+        self,
+        patch_id: str,
+        patched_files: list[dict[str, object]],
+        metadata: dict[str, object],
+    ) -> Path:
+        backup_dir = self.repopilot_backups_dir / patch_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        manifest_files: list[dict[str, object]] = []
+        for patched_file in patched_files:
+            target_path = self._patched_target_path(patched_file)
+            manifest_files.append(
+                {
+                    "path": self._format_repo_path(target_path),
+                    "existed_before": bool(patched_file.get("existed_before")),
+                }
+            )
+        manifest = {
+            "patch_id": patch_id,
+            "created_at": datetime.now().astimezone().isoformat(),
+            "diff_sha256": metadata.get("diff_sha256", ""),
+            "files": manifest_files,
+        }
+        manifest_path = backup_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return manifest_path
+
     def _rollback_patch_apply(self, patch_id: str, existing_files: list[Path], new_files: list[Path]) -> dict[str, object]:
         rollback_errors: list[str] = []
+        rollback_files: list[dict[str, object]] = []
         backup_dir = self.repopilot_backups_dir / patch_id
         for target_path in existing_files:
             backup_path = backup_dir / target_path.relative_to(self.repo_root)
@@ -800,23 +1101,33 @@ class RepositoryTools:
                     raise ToolError(f"backup file is missing: {self._format_repo_path(target_path)}")
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup_path, target_path)
+                rollback_files.append({"path": self._format_repo_path(target_path), "action": "restored", "ok": True})
             except (OSError, ToolError) as error:
-                rollback_errors.append(str(error))
+                error_message = str(error)
+                rollback_errors.append(error_message)
+                rollback_files.append(
+                    {"path": self._format_repo_path(target_path), "action": "restore", "ok": False, "error": error_message}
+                )
         for target_path in reversed(new_files):
             try:
                 if target_path.exists():
                     target_path.unlink()
                 self._remove_empty_parent_dirs(target_path.parent)
+                rollback_files.append({"path": self._format_repo_path(target_path), "action": "removed", "ok": True})
             except OSError as error:
-                rollback_errors.append(str(error))
+                error_message = str(error)
+                rollback_errors.append(error_message)
+                rollback_files.append(
+                    {"path": self._format_repo_path(target_path), "action": "remove", "ok": False, "error": error_message}
+                )
         rollback_ok = not rollback_errors
         self._append_run_event(
             patch_id,
             "rollback_success" if rollback_ok else "rollback_failure",
             "ok" if rollback_ok else "failed",
-            {"errors": rollback_errors},
+            {"errors": rollback_errors, "files": rollback_files},
         )
-        return {"attempted": True, "ok": rollback_ok, "errors": rollback_errors}
+        return {"attempted": True, "ok": rollback_ok, "errors": rollback_errors, "files": rollback_files}
 
     def _remove_empty_parent_dirs(self, start_dir: Path) -> None:
         current_dir = start_dir
@@ -1045,8 +1356,16 @@ class RepositoryTools:
         patch_id: str,
         instruction: str,
         paths: list[str],
+        target_files: list[dict[str, object]] | None = None,
+        diff_path: str = "",
+        diff_sha256: str = "",
+        run_id: str = "",
+        task: str = "",
+        summary: str = "",
+        plan_snapshot: object | None = None,
+        risk_level: str = "unknown",
         warnings: list[str] | None = None,
-        status: str = "proposed",
+        status: str = "pending_approval",
         created_at: datetime | None = None,
     ) -> dict[str, object]:
         self._validate_patch_id(patch_id)
@@ -1058,14 +1377,34 @@ class RepositoryTools:
             raise ToolError("warnings 必须是字符串列表")
         if not isinstance(status, str) or not status.strip():
             raise ToolError("status 必须是非空字符串")
+        if target_files is not None and not all(isinstance(target_file, dict) for target_file in target_files):
+            raise ToolError("target_files 必须是对象列表")
+        if not isinstance(diff_path, str):
+            raise ToolError("diff_path 必须是字符串")
+        if not isinstance(diff_sha256, str):
+            raise ToolError("diff_sha256 必须是字符串")
+        if not all(isinstance(value, str) for value in (run_id, task, summary, risk_level)):
+            raise ToolError("run_id、task、summary、risk_level 必须是字符串")
 
         timestamp = created_at or datetime.now().astimezone()
+        normalized_target_files = target_files if target_files is not None else []
         return {
             "patch_id": patch_id,
             "created_at": timestamp.isoformat(),
             "instruction": instruction,
+            "run_id": run_id,
+            "task": task,
+            "summary": summary,
             "status": status,
             "paths": paths,
+            "target_files": normalized_target_files,
+            "diff_path": diff_path,
+            "diff_sha256": diff_sha256,
+            "approved_at": None,
+            "applied_at": None,
+            "rejected_at": None,
+            "plan_snapshot": plan_snapshot,
+            "risk_level": risk_level,
             "warnings": warnings or [],
         }
 
@@ -1074,8 +1413,9 @@ class RepositoryTools:
         if not isinstance(patch_text, str):
             raise ToolError("patch_text 必须是字符串")
 
-        patch_path = self.repopilot_patches_dir / f"{patch_id}.patch"
-        patch_path.write_text(patch_text, encoding="utf-8")
+        patch_path = self._get_new_patch_file_path(patch_id)
+        patch_path.parent.mkdir(parents=True, exist_ok=False)
+        patch_path.write_bytes(patch_text.encode("utf-8"))
         return patch_path
 
     def _read_patch_file(self, patch_id: str) -> str:
@@ -1085,13 +1425,20 @@ class RepositoryTools:
 
         return patch_path.read_text(encoding="utf-8")
 
+    def _read_new_patch_file(self, patch_id: str) -> str:
+        patch_path = self._get_new_patch_file_path(patch_id)
+        if not patch_path.is_file():
+            raise ToolError(f"patch.diff 文件不存在: {patch_id}")
+        return patch_path.read_text(encoding="utf-8")
+
     def _write_patch_metadata(self, metadata: dict[str, object]) -> Path:
         patch_id = metadata.get("patch_id")
         if not isinstance(patch_id, str):
             raise ToolError("metadata.patch_id 必须是字符串")
         self._validate_patch_id(patch_id)
 
-        metadata_path = self.repopilot_patches_dir / f"{patch_id}.json"
+        metadata_path = self._get_new_patch_metadata_path(patch_id)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
         serialized_metadata = json.dumps(metadata, ensure_ascii=False, indent=2)
         metadata_path.write_text(serialized_metadata, encoding="utf-8")
         return metadata_path
@@ -1107,6 +1454,20 @@ class RepositoryTools:
             raise ToolError(f"metadata 不是有效 JSON: {patch_id}") from error
         if not isinstance(metadata, dict):
             raise ToolError(f"metadata 必须是 JSON 对象: {patch_id}")
+
+        return metadata
+
+    def _read_new_patch_metadata(self, patch_id: str) -> dict[str, object]:
+        metadata_path = self._get_new_patch_metadata_path(patch_id)
+        if not metadata_path.is_file():
+            raise ToolError(f"metadata.json 文件不存在: {patch_id}")
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ToolError(f"metadata.json 不是有效 JSON: {patch_id}") from error
+        if not isinstance(metadata, dict):
+            raise ToolError(f"metadata.json 必须是 JSON 对象: {patch_id}")
 
         return metadata
 
@@ -1149,11 +1510,59 @@ class RepositoryTools:
 
     def _get_patch_file_path(self, patch_id: str) -> Path:
         self._validate_patch_id(patch_id)
+        new_patch_path = self._get_new_patch_file_path(patch_id)
+        if new_patch_path.exists():
+            return new_patch_path
         return self.repopilot_patches_dir / f"{patch_id}.patch"
 
     def _get_patch_metadata_path(self, patch_id: str) -> Path:
         self._validate_patch_id(patch_id)
+        new_metadata_path = self._get_new_patch_metadata_path(patch_id)
+        if new_metadata_path.exists():
+            return new_metadata_path
         return self.repopilot_patches_dir / f"{patch_id}.json"
+
+    def _get_new_patch_file_path(self, patch_id: str) -> Path:
+        self._validate_patch_id(patch_id)
+        return self.repopilot_patches_dir / patch_id / "patch.diff"
+
+    def _get_new_patch_metadata_path(self, patch_id: str) -> Path:
+        self._validate_patch_id(patch_id)
+        return self.repopilot_patches_dir / patch_id / "metadata.json"
+
+    def _remove_patch_storage(self, patch_id: str) -> None:
+        self._validate_patch_id(patch_id)
+        patch_dir = self.repopilot_patches_dir / patch_id
+        if patch_dir.exists():
+            shutil.rmtree(patch_dir)
+        for legacy_path in (
+            self.repopilot_patches_dir / f"{patch_id}.patch",
+            self.repopilot_patches_dir / f"{patch_id}.json",
+        ):
+            if legacy_path.exists():
+                legacy_path.unlink()
+
+    def _build_patch_target_files(self, touched_paths: list[str]) -> list[dict[str, object]]:
+        target_files: list[dict[str, object]] = []
+        for touched_path in touched_paths:
+            target_path = self._validate_diff_target_path(touched_path, must_exist=False)
+            existed_before = target_path.is_file()
+            target_files.append(
+                {
+                    "path": touched_path,
+                    "existed_before": existed_before,
+                    "sha256_before": self._sha256_file(target_path) if existed_before else None,
+                    "operation": "modify" if existed_before else "create",
+                }
+            )
+        return target_files
+
+    def _sha256_file(self, file_path: Path) -> str:
+        digest = hashlib.sha256()
+        with file_path.open("rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _validate_patch_id(self, patch_id: str) -> None:
         if not isinstance(patch_id, str) or not patch_id.strip():

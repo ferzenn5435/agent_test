@@ -29,6 +29,7 @@ def verify_run_state(
     must_not_read_full_files: Iterable[str] | None = None,
     max_total_tool_output_chars: int | None = None,
     patch_confirmed: bool | None = None,
+    pending_patch: Mapping[str, object] | None = None,
 ) -> VerificationResult:
     """Verify a RunState against deterministic repo constraints."""
 
@@ -41,9 +42,10 @@ def verify_run_state(
 
     reasons: list[str] = []
     details: list[str] = []
+    pending_approval_terminal = _is_pending_approval_terminal(run_state, pending_patch)
 
     plan = run_state.plan
-    if run_state.stage != "FINISH":
+    if run_state.stage != "FINISH" and not pending_approval_terminal:
         reasons.append(REASON_NOT_FINISHED)
         details.append(f"stage={run_state.stage}")
 
@@ -70,14 +72,14 @@ def verify_run_state(
         if must_contain is not None
         else _plan_must_contain_rules(plan)
     )
-    if effective_must_contain:
+    if effective_must_contain and not pending_approval_terminal:
         must_contain_issues = _check_must_contain(repo_root, effective_must_contain)
         if must_contain_issues:
             reasons.append(REASON_MUST_CONTAIN_MISSING)
             details.extend(must_contain_issues)
 
     tests_result = run_state.tests_result
-    if tests_result is None or not tests_result.passed:
+    if not pending_approval_terminal and (tests_result is None or not tests_result.passed):
         reasons.append(REASON_TESTS_FAILED)
         if tests_result is None:
             details.append("tests_result is missing")
@@ -90,7 +92,9 @@ def verify_run_state(
     requires_patch_confirmation = bool(run_state.changed_files) or bool(
         plan is not None and plan.requires_patch
     )
-    if patch_confirmed is False:
+    if pending_approval_terminal:
+        pass
+    elif patch_confirmed is False:
         reasons.append(REASON_PATCH_NOT_CONFIRMED)
         details.append("patch_confirmed=False")
     elif patch_confirmed is None and requires_patch_confirmation:
@@ -145,6 +149,22 @@ def _check_allowed_changed_files(
             issues.append(f"changed_files unauthorized: {normalized_changed_file}")
 
     return issues
+
+
+def _is_pending_approval_terminal(
+    run_state: RunState,
+    pending_patch: Mapping[str, object] | None,
+) -> bool:
+    if run_state.stage not in {"AWAITING_APPROVAL", "FINISH"}:
+        return False
+    if "AWAITING_APPROVAL" not in run_state.stage_history:
+        return False
+    if pending_patch is None:
+        return False
+    if pending_patch.get("status") != "pending_approval":
+        return False
+    patch_id = pending_patch.get("patch_id")
+    return isinstance(patch_id, str) and bool(patch_id.strip())
 
 
 def _check_must_contain(

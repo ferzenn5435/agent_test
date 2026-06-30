@@ -7,7 +7,7 @@ import io
 import json
 import subprocess
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
@@ -18,8 +18,9 @@ from agent import CodeAnalysisAgent
 from eval_safety import write_eval_temp_marker
 from llm_client import LlmClient
 from logger import RunLogger
-from main import CliApplyPatchApproval, parse_args
+from main import CliApplyPatchApproval, main, parse_args
 from prompts import build_system_prompt
+from run_state import RunState
 from tools import RepositoryTools, ToolError
 
 
@@ -200,6 +201,174 @@ class MainParserTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parse_args(["--repo", ".", "--max-steps", raw_value, "question"])
 
+    def test_parse_args_accepts_patch_subcommands_without_question(self) -> None:
+        args = parse_args(["patch", "show", "--repo", ".", "20260630_120000_abcdef123456", "--full"])
+
+        self.assertEqual("patch", args.command)
+        self.assertEqual("show", args.patch_command)
+        self.assertEqual(".", args.repo_path)
+        self.assertEqual("20260630_120000_abcdef123456", args.patch_id)
+        self.assertTrue(args.full)
+        self.assertEqual("", args.question)
+
+
+class TestPatchCliCommands(unittest.TestCase):
+    """验证确定性 patch CLI 子命令不进入 LLM/agent 路径。"""
+
+    def test_patch_list_prints_required_metadata_without_agent_or_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            _, patch_id = self._create_saved_patch(repo_path)
+
+            exit_code, stdout_text, stderr_text = self._run_main_cli(
+                ["main.py", "patch", "list", "--repo", str(repo_path)]
+            )
+
+            self.assertEqual(0, exit_code, stderr_text)
+            self.assertEqual("", stderr_text)
+            output = json.loads(stdout_text)
+            self.assertTrue(output["ok"])
+            patches = output["patches"]
+            self.assertIsInstance(patches, list)
+            patch_entry = next(
+                patch for patch in patches if patch["patch_id"] == patch_id
+            )
+            self.assertEqual("pending_approval", patch_entry["status"])
+            self.assertIn("created_at", patch_entry)
+            self.assertIn("summary", patch_entry)
+            target_files = patch_entry["target_files"]
+            self.assertIsInstance(target_files, list)
+            self.assertEqual("sample.txt", target_files[0]["path"])
+            self.assertEqual("modify", target_files[0]["operation"])
+            self.assertTrue(target_files[0]["existed_before"])
+            self.assertIsInstance(target_files[0]["sha256_before"], str)
+
+    def test_patch_show_preview_and_full_diff_without_agent_or_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            _, patch_id = self._create_saved_patch(repo_path)
+
+            preview_code, preview_stdout, preview_stderr = self._run_main_cli(
+                ["main.py", "patch", "show", "--repo", str(repo_path), patch_id]
+            )
+            full_code, full_stdout, full_stderr = self._run_main_cli(
+                ["main.py", "patch", "show", "--repo", str(repo_path), patch_id, "--full"]
+            )
+
+            self.assertEqual(0, preview_code, preview_stderr)
+            self.assertEqual("", preview_stderr)
+            preview_output = json.loads(preview_stdout)
+            self.assertTrue(preview_output["ok"])
+            self.assertEqual(patch_id, preview_output["metadata"]["patch_id"])
+            self.assertIn("-old line", preview_output["diff_preview"])
+            self.assertIn("+new line", preview_output["diff_preview"])
+
+            self.assertEqual(0, full_code, full_stderr)
+            self.assertEqual("", full_stderr)
+            full_output = json.loads(full_stdout)
+            self.assertTrue(full_output["ok"])
+            self.assertIn("diff --git a/sample.txt b/sample.txt", full_output["diff"])
+            self.assertIn("+new line", full_output["diff"])
+
+    def test_patch_apply_uses_deterministic_service_without_agent_llm_or_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            _, patch_id = self._create_saved_patch(repo_path)
+
+            exit_code, stdout_text, stderr_text = self._run_main_cli(
+                ["main.py", "patch", "apply", "--repo", str(repo_path), patch_id]
+            )
+
+            self.assertEqual(0, exit_code, stderr_text)
+            self.assertEqual("", stderr_text)
+            output = json.loads(stdout_text)
+            self.assertTrue(output["ok"])
+            self.assertEqual("applied", output["status"])
+            self.assertEqual("new line\n", (repo_path / "sample.txt").read_text(encoding="utf-8"))
+
+    def test_patch_apply_rejected_patch_returns_nonzero_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            _, patch_id = self._create_saved_patch(repo_path)
+            reject_code, _, reject_stderr = self._run_main_cli(
+                ["main.py", "patch", "reject", "--repo", str(repo_path), patch_id]
+            )
+            self.assertEqual(0, reject_code, reject_stderr)
+
+            apply_code, stdout_text, stderr_text = self._run_main_cli(
+                ["main.py", "patch", "apply", "--repo", str(repo_path), patch_id]
+            )
+
+            self.assertNotEqual(0, apply_code)
+            self.assertEqual("", stdout_text)
+            self.assertIn("patch command failed", stderr_text)
+            self.assertIn("only status=pending_approval patches can be applied or rejected", stderr_text)
+            self.assertEqual("old line\n", (repo_path / "sample.txt").read_text(encoding="utf-8"))
+
+    def test_patch_show_missing_patch_returns_nonzero_stderr_without_agent_or_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+
+            exit_code, stdout_text, stderr_text = self._run_main_cli(
+                ["main.py", "patch", "show", "--repo", str(repo_path), "20260630_120000_abcdef123456"]
+            )
+
+            self.assertNotEqual(0, exit_code)
+            self.assertEqual("", stdout_text)
+            self.assertIn("patch command failed", stderr_text)
+            self.assertIn("metadata.json 文件不存在", stderr_text)
+
+    def test_patch_reject_prints_result_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            _, patch_id = self._create_saved_patch(repo_path)
+
+            exit_code, stdout_text, stderr_text = self._run_main_cli(
+                ["main.py", "patch", "reject", "--repo", str(repo_path), patch_id]
+            )
+
+            self.assertEqual(0, exit_code, stderr_text)
+            self.assertEqual("", stderr_text)
+            output = json.loads(stdout_text)
+            self.assertTrue(output["ok"])
+            self.assertEqual("rejected", output["status"])
+            self.assertEqual("old line\n", (repo_path / "sample.txt").read_text(encoding="utf-8"))
+
+    def _run_main_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        with patch("sys.argv", argv):
+            with patch("main.CodeAnalysisAgent") as mocked_agent:
+                with patch("main.load_llm_config_from_env") as mocked_load_config:
+                    with patch("builtins.input") as mocked_input:
+                        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                            exit_code = main()
+        mocked_agent.assert_not_called()
+        mocked_load_config.assert_not_called()
+        mocked_input.assert_not_called()
+        return exit_code, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+
+    def _create_saved_patch(self, repo_path: Path) -> tuple[RepositoryTools, str]:
+        (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")
+        repository_tools = RepositoryTools(repo_path)
+        diff_text = "\n".join(
+            [
+                "diff --git a/sample.txt b/sample.txt",
+                "--- a/sample.txt",
+                "+++ b/sample.txt",
+                "@@ -1,1 +1,1 @@",
+                "-old line",
+                "+new line",
+            ]
+        )
+        propose_result = repository_tools.propose_patch(
+            instruction="update sample text",
+            diff=diff_text,
+        )
+        self.assertTrue(propose_result["ok"])
+        patch_id_value = propose_result["patch_id"]
+        self.assertIsInstance(patch_id_value, str)
+        return repository_tools, cast(str, patch_id_value)
 
 class TestPromptV03SafetyFlow(unittest.TestCase):
     """验证 v0.3 prompt 的工具契约与人工确认安全流程。"""
@@ -230,11 +399,18 @@ class TestPromptV03SafetyFlow(unittest.TestCase):
         self.assertIn("任何修改都必须先调用 propose_patch", self.prompt)
         self.assertIn("propose_patch 只保存补丁提案，不修改目标文件", self.prompt)
 
-    def test_apply_requires_cli_approval_and_tests_after_success(self) -> None:
-        self.assertIn("apply_patch 需要用户确认", self.prompt)
-        self.assertIn("通过 CLI 明确批准", self.prompt)
-        self.assertIn("绝对禁止调用 apply_patch", self.prompt)
-        self.assertIn("apply_patch 成功后，必须调用 run_tests", self.prompt)
+    def test_pending_approval_protocol_does_not_instruct_ordinary_apply(self) -> None:
+        self.assertIn("pending approval", self.prompt)
+        self.assertIn("返回 pending approval 和 patch_id", self.prompt)
+        self.assertIn("propose_patch 成功后不要调用 apply_patch", self.prompt)
+        self.assertIn("也不要继续 run_tests", self.prompt)
+        self.assertIn("python main.py patch show --repo . <patch_id>", self.prompt)
+        self.assertIn("python main.py patch apply --repo . <patch_id>", self.prompt)
+        self.assertIn("python main.py patch reject --repo . <patch_id>", self.prompt)
+        self.assertIn("status=pending_approval", self.prompt)
+        self.assertIn("applied=false", self.prompt)
+        self.assertIn("status=applied", self.prompt)
+        self.assertIn("auto_for_eval 例外只由 eval runner", self.prompt)
         self.assertIn("command_name: unit 或 compile", self.prompt)
 
     def test_finish_requires_changed_files_tests_and_manual_review(self) -> None:
@@ -302,10 +478,37 @@ class TestReadmeDocumentation(unittest.TestCase):
             "python run_edit_eval.py --cases eval_cases/context_cases.json",
             "普通 CLI 的 `apply_patch` 仍然要求用户手动确认",
             "`auto_for_eval` 只允许评测 runner 在带 marker 的临时 eval repo 中使用",
+            "评测仍使用带 marker 校验的临时 repo 和 `auto_for_eval`",
+            "真实 repo 和普通 CLI 不默认自动应用补丁",
             "v0.5 上下文管理与项目索引",
         ]:
             with self.subTest(expected_text=expected_text):
                 self.assertIn(expected_text, self.readme_text)
+
+    def test_v061_pending_approval_docs_pin_cli_and_apply_safety(self) -> None:
+        for expected_text in [
+            "## v0.6.1 Pending Approval",
+            "普通非交互编辑任务只生成待审批补丁",
+            "不会在真实项目中继续应用补丁或运行应用后的测试",
+            "python main.py patch list --repo .",
+            "python main.py patch show --repo . <patch_id>",
+            "python main.py patch show --repo . <patch_id> --full",
+            "python main.py patch apply --repo . <patch_id>",
+            "python main.py patch reject --repo . <patch_id>",
+            "不调用 LLM",
+            "sha256",
+            "path",
+            "target_files",
+            ".repopilot/backups/<patch_id>",
+            "回滚",
+            "plan_snapshot.test_commands",
+            "只允许 `unit` 和 `compile`",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+        self.assertNotIn("--yes", self.readme_text)
+        self.assertNotIn("真实 repo 自动应用", self.readme_text)
 
     def test_model_output_examples_include_plan_step_id(self) -> None:
         self.assertIn(
@@ -318,11 +521,11 @@ class TestReadmeDocumentation(unittest.TestCase):
 class TestMainApplyApproval(unittest.TestCase):
     """验证 CLI apply_patch 人工确认门。"""
 
-    def test_default_constructor_uses_manual_approval_and_calls_input(self) -> None:
+    def test_manual_constructor_uses_approval_prompt_and_calls_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             repository_tools, patch_id = self._create_saved_patch(repo_path)
-            approval_gate = CliApplyPatchApproval(repository_tools)
+            approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual")
             tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
 
             with patch("builtins.input", return_value="yes") as mocked_input:
@@ -341,7 +544,7 @@ class TestMainApplyApproval(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     repo_path = Path(temp_dir)
                     repository_tools, patch_id = self._create_saved_patch(repo_path)
-                    approval_gate = CliApplyPatchApproval(repository_tools)
+                    approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual")
                     tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
                     stdout_buffer = io.StringIO()
 
@@ -377,7 +580,7 @@ class TestMainApplyApproval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             repository_tools, patch_id = self._create_saved_patch(repo_path)
-            approval_gate = CliApplyPatchApproval(repository_tools)
+            approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual")
             agent = CodeAnalysisAgent(
                 llm_client=cast(LlmClient, object()),
                 repository_tools=repository_tools,
@@ -388,7 +591,7 @@ class TestMainApplyApproval(unittest.TestCase):
 
             with patch("builtins.input", return_value="yes"):
                 with redirect_stdout(io.StringIO()):
-                    apply_result = agent._run_tool(apply_call)
+                    apply_result = agent._run_tool(apply_call, RunState(), "apply test")
 
             self.assertTrue(apply_result["ok"], apply_result)
             self.assertEqual("new line\n", (repo_path / "sample.txt").read_text())
@@ -418,7 +621,7 @@ class TestMainApplyApproval(unittest.TestCase):
                     for event in patch_events
                 )
             )
-            metadata_path = repository_tools.repopilot_patches_dir / f"{patch_id}.json"
+            metadata_path = repository_tools.repopilot_patches_dir / patch_id / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual("applied", metadata["status"])
             self.assertEqual(["sample.txt"], metadata["paths"])
@@ -448,7 +651,7 @@ class TestMainApplyApproval(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     repo_path = Path(temp_dir)
                     repository_tools, patch_id = self._create_saved_patch(repo_path)
-                    approval_gate = CliApplyPatchApproval(repository_tools)
+                    approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual")
                     agent = CodeAnalysisAgent(
                         llm_client=cast(LlmClient, object()),
                         repository_tools=repository_tools,
@@ -459,7 +662,7 @@ class TestMainApplyApproval(unittest.TestCase):
 
                     with patch("builtins.input", return_value=rejection_text):
                         with redirect_stdout(io.StringIO()):
-                            tool_result = agent._run_tool(tool_call)
+                            tool_result = agent._run_tool(tool_call, RunState(), "apply test")
 
                     self.assertFalse(tool_result["ok"])
                     self.assertIsInstance(tool_result["error"], str)
@@ -482,14 +685,14 @@ class TestMainApplyApproval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             repository_tools, patch_id = self._create_saved_patch(repo_path)
-            metadata_path = repository_tools.repopilot_patches_dir / f"{patch_id}.json"
+            metadata_path = repository_tools.repopilot_patches_dir / patch_id / "metadata.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata["paths"] = ["other.txt"]
             metadata_path.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            approval_gate = CliApplyPatchApproval(repository_tools)
+            approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual")
             tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
 
             with patch("builtins.input", return_value="yes") as mocked_input:
@@ -505,6 +708,39 @@ class TestMainApplyApproval(unittest.TestCase):
             events = self._read_run_events(repository_tools, patch_id)
             event_types = [str(event["event_type"]) for event in events]
             self.assertEqual(["proposed"], event_types)
+
+    def test_manual_pending_apply_patch_returns_pending_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            repository_tools, patch_id = self._create_saved_patch(repo_path)
+            approval_gate = CliApplyPatchApproval(repository_tools, approval_mode="manual_pending")
+            tool_call = {"tool": "apply_patch", "args": {"patch_id": patch_id}}
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, object()),
+                repository_tools=repository_tools,
+                run_logger=cast(RunLogger, object()),
+                tool_runner=approval_gate.run_tool,
+            )
+
+            with patch("builtins.input") as mocked_input:
+                tool_result = agent._run_tool(tool_call, RunState(), "apply test")
+
+            mocked_input.assert_not_called()
+            self.assertTrue(tool_result["ok"])
+            output = cast(dict[str, object], tool_result["output"])
+            self.assertEqual("pending_approval", output["status"])
+            self.assertEqual(patch_id, output["patch_id"])
+            self.assertFalse(output["applied"])
+            self.assertFalse(agent._is_confirmed_apply_patch(tool_call, tool_result))
+            self.assertEqual("old line\n", (repo_path / "sample.txt").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [
+                    f"python main.py patch show --repo . {patch_id}",
+                    f"python main.py patch apply --repo . {patch_id}",
+                    f"python main.py patch reject --repo . {patch_id}",
+                ],
+                output["next_commands"],
+            )
 
     def test_auto_for_eval_rejects_repo_without_marker_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -570,6 +806,29 @@ class TestMainApplyApproval(unittest.TestCase):
             self.assertTrue(
                 any(event["event_type"] == "apply_success" for event in events)
             )
+
+    def test_ordinary_cli_constructs_manual_pending_agent_without_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            with patch("sys.argv", ["main.py", "--repo", str(repo_path), "question"]):
+                with patch("main.load_llm_config_from_env", return_value=object()):
+                    with patch("main.LlmClient", return_value=cast(LlmClient, object())):
+                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                            mocked_agent = mocked_agent_class.return_value
+                            mocked_agent.answer.return_value = "done"
+                            with patch("builtins.input") as mocked_input:
+                                stdout_buffer = io.StringIO()
+                                with redirect_stdout(stdout_buffer):
+                                    exit_code = main()
+
+        self.assertEqual(0, exit_code)
+        mocked_input.assert_not_called()
+        self.assertIn("done", stdout_buffer.getvalue())
+        agent_kwargs = mocked_agent_class.call_args.kwargs
+        self.assertTrue(agent_kwargs["pending_approval_mode"])
+        approval_gate = agent_kwargs["tool_runner"].__self__
+        self.assertIsInstance(approval_gate, CliApplyPatchApproval)
+        self.assertEqual("manual_pending", approval_gate.approval_mode)
 
     def _create_saved_patch(self, repo_path: Path) -> tuple[RepositoryTools, str]:
         (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")
@@ -960,6 +1219,82 @@ class TestAgentContextV05(unittest.TestCase):
             tool_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
             self.assertFalse(tool_result["ok"])
             self.assertIn("propose_patch", str(tool_result["error"]))
+
+    def test_pending_approval_mode_returns_after_successful_propose_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "sample.py").write_text("print('old')\n", encoding="utf-8")
+            diff_text = "\n".join(
+                [
+                    "diff --git a/sample.py b/sample.py",
+                    "--- a/sample.py",
+                    "+++ b/sample.py",
+                    "@@ -1,1 +1,1 @@",
+                    "-print('old')",
+                    "+print('ok')",
+                ]
+            )
+            fake_llm = FakeLlmClient(
+                [
+                    _task_plan_json(
+                        task_type="edit",
+                        requires_patch=True,
+                        requires_tests=True,
+                        expected_changed_files=("sample.py",),
+                    ),
+                    _agent_tool_call(
+                        "propose_patch",
+                        {"instruction": "update sample", "diff": diff_text},
+                    ),
+                    _agent_tool_call("apply_patch", {"patch_id": "should_not_be_called"}),
+                ],
+                prepend_plan=False,
+            )
+            run_logger = RunLogger(repo_path=repo_path, user_task="pending", log_dir=repo_path / "logs")
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=3,
+                pending_approval_mode=True,
+            )
+
+            final_answer = agent.answer("修改 sample")
+
+            self.assertEqual("print('old')\n", (repo_path / "sample.py").read_text(encoding="utf-8"))
+            self.assertIn("补丁已生成但尚未应用", final_answer)
+            self.assertIn("patch_id:", final_answer)
+            patch_id_line = next(
+                line for line in final_answer.splitlines() if line.startswith("patch_id: ")
+            )
+            patch_id = patch_id_line.removeprefix("patch_id: ")
+            metadata_path = repo_path / ".repopilot" / "patches" / patch_id / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertIn("sample.py", final_answer)
+            self.assertIn("diff preview summary", final_answer)
+            self.assertIn(f"python main.py patch show --repo . {patch_id}", final_answer)
+            self.assertIn(f"python main.py patch apply --repo . {patch_id}", final_answer)
+            self.assertIn(f"python main.py patch reject --repo . {patch_id}", final_answer)
+            self.assertEqual("修改 sample", metadata["task"])
+            self.assertEqual("update sample", metadata["summary"])
+            self.assertEqual(str(run_logger.log_path), metadata["run_id"])
+            self.assertEqual("low", metadata["risk_level"])
+            plan_snapshot = metadata["plan_snapshot"]
+            self.assertIsInstance(plan_snapshot, dict)
+            if not isinstance(plan_snapshot, dict):
+                self.fail("plan_snapshot should be a dict")
+            self.assertEqual(True, plan_snapshot["requires_tests"])
+            self.assertEqual([{"command_name": "unit"}], plan_snapshot["test_commands"])
+            self.assertEqual(2, fake_llm.call_count)
+            self.assertEqual(
+                ["INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "FINISH"],
+                run_logger.payload["stage_history"],
+            )
+            self.assertEqual("FINISH", run_logger.payload["stage"])
+            verify_status = cast(dict[str, object], run_logger.payload["verify_status"])
+            self.assertTrue(verify_status["passed"])
+            steps = cast(list[dict[str, object]], run_logger.payload["steps"])
+            self.assertEqual("propose_patch", cast(dict[str, object], steps[0]["tool_call"])["tool"])
 
     def test_logger_writes_context_stats_on_finish(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

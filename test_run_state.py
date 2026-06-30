@@ -199,6 +199,38 @@ class TestRunStateV06(unittest.TestCase):
         with self.assertRaisesRegex(RunStateError, "EXECUTE -> FINISH"):
             run_state.transition("FINISH")
 
+    def test_execute_awaiting_approval_finish_transition_passes(self) -> None:
+        run_state = RunState().transition("PLAN").with_plan(_valid_plan("edit"))
+        run_state = run_state.transition("EXECUTE")
+        run_state = run_state.with_execution_step("提交补丁等待批准")
+        run_state = run_state.transition("AWAITING_APPROVAL")
+        run_state = run_state.transition("FINISH")
+
+        state_dict = run_state.to_dict()
+
+        self.assertEqual("FINISH", run_state.stage)
+        self.assertEqual(
+            ("INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "FINISH"),
+            run_state.stage_history,
+        )
+        self.assertEqual(
+            ["INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "FINISH"],
+            state_dict["stage_history"],
+        )
+        json.dumps(state_dict)
+
+    def test_awaiting_approval_only_allows_finish(self) -> None:
+        run_state = RunState().transition("PLAN").with_plan(_valid_plan("edit"))
+        run_state = run_state.transition("EXECUTE").transition("AWAITING_APPROVAL")
+
+        for next_stage in ["VERIFY", "REPAIR", "EXECUTE"]:
+            with self.subTest(next_stage=next_stage):
+                with self.assertRaisesRegex(
+                    RunStateError,
+                    f"AWAITING_APPROVAL -> {next_stage}",
+                ):
+                    run_state.transition(next_stage)
+
     def test_repair_attempt_greater_than_one_rejects(self) -> None:
         failed_result = VerificationResult(command_name="unit", passed=False, exit_code=1)
         run_state = RunState().transition("PLAN").with_plan(_valid_plan("edit"))

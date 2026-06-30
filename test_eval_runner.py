@@ -14,9 +14,15 @@ from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
+from agent import CodeAnalysisAgent
 from config import MAX_STEPS
+from llm_client import LlmClient
+from logger import RunLogger
+from main import main as cli_main
+from tools import RepositoryTools
 
 eval_runner = importlib.import_module("eval_runner")
 eval_safety = importlib.import_module("eval_safety")
@@ -257,6 +263,7 @@ class TestFakeLlmClient(unittest.TestCase):
 
         self.assertIn(eval_case.prompt, eval_prompt)
         self.assertIn("auto_for_eval 自动批准", eval_prompt)
+        self.assertIn("评测临时仓库", eval_prompt)
         self.assertIn("直接调用 apply_patch", eval_prompt)
         self.assertIn("不要额外调用 inspect_repo", eval_prompt)
         self.assertIn("不要重复读取同一文件", eval_prompt)
@@ -948,6 +955,36 @@ class TestEditEvalRunner(unittest.TestCase):
         self.assertEqual(("app.py",), results[0]["changed_files"])
         self.assertEqual((), results[1]["changed_files"])
 
+    def test_pending_approval_patch_metadata_and_cli_apply_reject_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            apply_repo = self._create_pending_eval_repo(temp_root / "apply-repo")
+            reject_repo = self._create_pending_eval_repo(temp_root / "reject-repo")
+
+            apply_patch_id = self._generate_pending_patch(apply_repo)
+            reject_patch_id = self._generate_pending_patch(reject_repo)
+
+            self._assert_pending_patch_metadata(apply_repo, apply_patch_id)
+            self._assert_pending_patch_metadata(reject_repo, reject_patch_id)
+            self.assertEqual("old line\n", (apply_repo / "sample.txt").read_text(encoding="utf-8"))
+            self.assertEqual("old line\n", (reject_repo / "sample.txt").read_text(encoding="utf-8"))
+
+            reject_exit_code, reject_output = self._run_patch_cli("reject", reject_repo, reject_patch_id)
+            rejected_metadata = self._read_patch_metadata(reject_repo, reject_patch_id)
+            self.assertEqual(0, reject_exit_code)
+            self.assertTrue(reject_output["ok"])
+            self.assertEqual("rejected", reject_output["status"])
+            self.assertEqual("rejected", rejected_metadata["status"])
+            self.assertEqual("old line\n", (reject_repo / "sample.txt").read_text(encoding="utf-8"))
+
+            apply_exit_code, apply_output = self._run_patch_cli("apply", apply_repo, apply_patch_id)
+            applied_metadata = self._read_patch_metadata(apply_repo, apply_patch_id)
+            self.assertEqual(0, apply_exit_code)
+            self.assertTrue(apply_output["ok"])
+            self.assertEqual("applied", apply_output["status"])
+            self.assertEqual("applied", applied_metadata["status"])
+            self.assertEqual("new line\n", (apply_repo / "sample.txt").read_text(encoding="utf-8"))
+
     def _snapshot_log_dir(self, log_dir: Path) -> tuple[tuple[str, int, int], ...]:
         if not log_dir.exists():
             return ()
@@ -964,6 +1001,79 @@ class TestEditEvalRunner(unittest.TestCase):
                 )
             )
         return tuple(sorted(snapshots))
+
+    def _create_pending_eval_repo(self, repo_path: Path) -> Path:
+        repo_path.mkdir()
+        (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")
+        return repo_path
+
+    def _generate_pending_patch(self, repo_path: Path) -> str:
+        diff_text = _unified_diff("sample.txt", "old line\n", "new line\n")
+        fake_llm = FakeLlmClient(
+            [
+                _task_plan_json(
+                    task_type="edit",
+                    requires_patch=True,
+                    expected_changed_files=("sample.txt",),
+                ),
+                _tool_call(
+                    "propose_patch",
+                    {"instruction": "更新 sample.txt。", "diff": diff_text},
+                ),
+            ],
+            prepend_plan=False,
+        )
+        run_logger = RunLogger(
+            repo_path=repo_path,
+            user_task="生成待审批补丁",
+            log_dir=repo_path / "logs",
+        )
+        agent = CodeAnalysisAgent(
+            llm_client=cast(LlmClient, fake_llm),
+            repository_tools=RepositoryTools(repo_path),
+            run_logger=run_logger,
+            max_steps=2,
+            pending_approval_mode=True,
+        )
+
+        final_answer = agent.answer("更新 sample.txt")
+
+        self.assertEqual("old line\n", (repo_path / "sample.txt").read_text(encoding="utf-8"))
+        self.assertIn("补丁已生成但尚未应用", final_answer)
+        stage_history = run_logger.payload["stage_history"]
+        self.assertIsInstance(stage_history, list)
+        self.assertIn("AWAITING_APPROVAL", cast(list[object], stage_history))
+        patch_id_line = next(
+            line for line in final_answer.splitlines() if line.startswith("patch_id: ")
+        )
+        return patch_id_line.removeprefix("patch_id: ")
+
+    def _assert_pending_patch_metadata(self, repo_path: Path, patch_id: str) -> None:
+        metadata = self._read_patch_metadata(repo_path, patch_id)
+        self.assertEqual(patch_id, metadata["patch_id"])
+        self.assertEqual("pending_approval", metadata["status"])
+        self.assertEqual(["sample.txt"], metadata["paths"])
+
+    def _read_patch_metadata(self, repo_path: Path, patch_id: str) -> dict[str, object]:
+        metadata_path = repo_path / ".repopilot" / "patches" / patch_id / "metadata.json"
+        self.assertTrue(metadata_path.is_file(), metadata_path)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(metadata, dict)
+        return metadata
+
+    def _run_patch_cli(
+        self,
+        patch_command: str,
+        repo_path: Path,
+        patch_id: str,
+    ) -> tuple[int, dict[str, object]]:
+        stdout = io.StringIO()
+        argv = ["main.py", "patch", patch_command, "--repo", str(repo_path), patch_id]
+        with patch.object(sys, "argv", argv), redirect_stdout(stdout):
+            exit_code = cli_main()
+        output = json.loads(stdout.getvalue())
+        self.assertIsInstance(output, dict)
+        return exit_code, output
 
 
 class TestEvalRunnerV06LogChecks(unittest.TestCase):

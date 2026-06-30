@@ -35,12 +35,14 @@ class CodeAnalysisAgent:
         run_logger: RunLogger,
         max_steps: int = MAX_STEPS,
         tool_runner: Callable[[dict[str, object]], object] | None = None,
+        pending_approval_mode: bool = False,
     ) -> None:
         self.llm_client = llm_client
         self.repository_tools = repository_tools
         self.run_logger = run_logger
         self.max_steps = max_steps
         self.tool_runner = tool_runner or repository_tools.run_tool
+        self.pending_approval_mode = pending_approval_mode
         self.context_stats = ContextStats()
 
     def answer(self, question: str) -> str:
@@ -51,6 +53,7 @@ class CodeAnalysisAgent:
         latest_test_result: VerificationResult | None = None
         patch_confirmed = False
         propose_patch_succeeded = False
+        pending_patch_to_return: dict[str, object] | None = None
         observation_summaries: list[dict[str, object]] = []
         messages = [
             {
@@ -139,7 +142,7 @@ class CodeAnalysisAgent:
                     )
 
                 if execution_gate_error is None:
-                    tool_result = self._run_tool(tool_call)
+                    tool_result = self._run_tool(tool_call, run_state, question)
                     run_state = self._record_execution_state(
                         run_state=run_state,
                         tool_call=tool_call,
@@ -150,6 +153,8 @@ class CodeAnalysisAgent:
                         latest_test_result = test_result
                     if self._is_successful_propose_patch(tool_call, tool_result):
                         propose_patch_succeeded = True
+                        if self.pending_approval_mode:
+                            pending_patch_to_return = self._pending_patch_from_tool_result(tool_result)
                     if self._is_confirmed_apply_patch(tool_call, tool_result):
                         patch_confirmed = True
                 else:
@@ -168,6 +173,25 @@ class CodeAnalysisAgent:
                     tool_call=tool_call,
                     tool_result=tool_result,
                 )
+
+                if pending_patch_to_return is not None:
+                    awaiting_state = run_state.transition("AWAITING_APPROVAL")
+                    finished_state = awaiting_state.transition("FINISH")
+                    verified_state, verify_status = self._verify_finished_run(
+                        run_state=awaiting_state,
+                        context_stats=context_stats,
+                        patch_confirmed=False,
+                        pending_patch=pending_patch_to_return,
+                    )
+                    self._update_logger_state_payload(finished_state, verify_status)
+                    final_answer = self._format_pending_approval_final_answer(
+                        pending_patch=pending_patch_to_return,
+                        run_state=finished_state,
+                        verify_status=verify_status,
+                    )
+                    self.run_logger.set_context_stats(context_stats.to_dict())
+                    self.run_logger.set_final_answer(final_answer)
+                    return final_answer
 
                 if tool_call["tool"] == "finish" and tool_result["ok"] is True:
                     final_answer = str(tool_result["output"])
@@ -335,13 +359,68 @@ class CodeAnalysisAgent:
             return "apply_patch 必须在同一次执行中成功调用 propose_patch 之后才能执行"
         return None
 
-    def _run_tool(self, tool_call: dict[str, object]) -> dict[str, object]:
+    def _run_tool(
+        self,
+        tool_call: dict[str, object],
+        run_state: RunState,
+        user_task: str,
+    ) -> dict[str, object]:
+        prepared_tool_call = self._prepare_tool_call(tool_call, run_state, user_task)
+        tool_call.clear()
+        tool_call.update(prepared_tool_call)
         try:
             tool_output = self.tool_runner(tool_call)
         except ToolError as error:
             return {"ok": False, "error": str(error)}
 
         return {"ok": True, "output": tool_output}
+
+    def _prepare_tool_call(
+        self,
+        tool_call: dict[str, object],
+        run_state: RunState,
+        user_task: str,
+    ) -> dict[str, object]:
+        if tool_call.get("tool") != "propose_patch":
+            return dict(tool_call)
+
+        prepared_tool_call = dict(tool_call)
+        tool_args = self._tool_args(tool_call)
+        prepared_args = dict(tool_args)
+        instruction = prepared_args.get("instruction")
+        summary = instruction if isinstance(instruction, str) and instruction.strip() else user_task
+        prepared_args["run_id"] = self._current_run_id()
+        prepared_args["task"] = user_task
+        prepared_args["summary"] = summary
+        prepared_args["plan_snapshot"] = self._build_patch_plan_snapshot(run_state.plan)
+        if run_state.plan is not None:
+            prepared_args["risk_level"] = run_state.plan.risk_level
+        prepared_tool_call["args"] = prepared_args
+        return prepared_tool_call
+
+    def _current_run_id(self) -> str:
+        log_path = getattr(self.run_logger, "log_path", None)
+        if log_path is not None:
+            return str(log_path)
+        payload = getattr(self.run_logger, "payload", None)
+        if isinstance(payload, dict):
+            started_at = payload.get("started_at")
+            if isinstance(started_at, str) and started_at.strip():
+                return started_at
+        return "agent-run"
+
+    def _build_patch_plan_snapshot(self, plan: TaskPlan | None) -> dict[str, object]:
+        if plan is None:
+            return {"test_commands": []}
+
+        plan_snapshot = plan.to_dict()
+        plan_snapshot["test_commands"] = self._plan_test_commands(plan)
+        return plan_snapshot
+
+    def _plan_test_commands(self, plan: TaskPlan) -> list[dict[str, str]]:
+        if plan.requires_tests:
+            return [{"command_name": "unit"}]
+        return []
 
     def _record_execution_state(
         self,
@@ -427,7 +506,7 @@ class CodeAnalysisAgent:
         if tool_call.get("tool") != "apply_patch" or tool_result.get("ok") is not True:
             return False
         tool_output = tool_result.get("output")
-        return isinstance(tool_output, dict) and tool_output.get("ok") is True
+        return isinstance(tool_output, dict) and tool_output.get("status") == "applied"
 
     def _is_successful_propose_patch(
         self,
@@ -444,14 +523,90 @@ class CodeAnalysisAgent:
         run_state: RunState,
         context_stats: ContextStats,
         patch_confirmed: bool,
+        pending_patch: dict[str, object] | None = None,
     ) -> tuple[RunState, VerificationResult]:
         state_with_tests = run_state.with_context_stats(context_stats.to_dict())
         verify_status = verifier.verify_run_state(
             state_with_tests,
             self.repository_tools.repo_root,
             patch_confirmed=patch_confirmed if patch_confirmed else None,
+            pending_patch=pending_patch,
         )
         return state_with_tests, verify_status
+
+    def _pending_patch_from_tool_result(self, tool_result: dict[str, object]) -> dict[str, object]:
+        tool_output = tool_result.get("output")
+        if not isinstance(tool_output, dict):
+            return {}
+
+        patch_id = tool_output.get("patch_id")
+        target_files = tool_output.get("target_files")
+        diff_preview = tool_output.get("diff_preview")
+        next_commands = tool_output.get("next_commands")
+        paths = tool_output.get("paths")
+        return {
+            "status": "pending_approval",
+            "patch_id": patch_id if isinstance(patch_id, str) else "",
+            "target_files": target_files if isinstance(target_files, list) else [],
+            "paths": paths if isinstance(paths, list) else [],
+            "diff_preview": diff_preview if isinstance(diff_preview, str) else "",
+            "next_commands": next_commands if isinstance(next_commands, list) else [],
+        }
+
+    def _format_pending_approval_final_answer(
+        self,
+        pending_patch: dict[str, object],
+        run_state: RunState,
+        verify_status: VerificationResult,
+    ) -> str:
+        patch_id = str(pending_patch.get("patch_id", ""))
+        target_file_lines = self._format_pending_target_files(pending_patch)
+        diff_preview = str(pending_patch.get("diff_preview", "")) or "(empty diff preview)"
+        show_command = f"python main.py patch show --repo . {patch_id}"
+        apply_command = f"python main.py patch apply --repo . {patch_id}"
+        reject_command = f"python main.py patch reject --repo . {patch_id}"
+        verification_label = "passed" if verify_status.passed else "failed"
+        return "\n".join(
+            [
+                "补丁已生成但尚未应用，当前运行已进入 awaiting approval。",
+                f"patch_id: {patch_id}",
+                "target files:",
+                target_file_lines,
+                "diff preview summary:",
+                diff_preview,
+                "exact commands:",
+                f"- show: {show_command}",
+                f"- apply: {apply_command}",
+                f"- reject: {reject_command}",
+                "",
+                "v0.6 summary:",
+                f"- execution steps: {', '.join(run_state.execution_steps) or 'none'}",
+                "- changed files: none (pending approval, not applied)",
+                "- tests: not_run (pending approval)",
+                f"- verification: {verification_label} ({verify_status.command_name})",
+                f"- repair: attempts={run_state.repair_attempts} status=not_attempted",
+            ]
+        )
+
+    def _format_pending_target_files(self, pending_patch: dict[str, object]) -> str:
+        target_files = pending_patch.get("target_files")
+        if isinstance(target_files, list) and target_files:
+            lines: list[str] = []
+            for target_file in target_files:
+                if isinstance(target_file, dict):
+                    path = target_file.get("path")
+                    operation = target_file.get("operation", "modify")
+                    if isinstance(path, str) and path:
+                        lines.append(f"- {path} ({operation})")
+                elif isinstance(target_file, str) and target_file:
+                    lines.append(f"- {target_file}")
+            if lines:
+                return "\n".join(lines)
+
+        paths = pending_patch.get("paths")
+        if isinstance(paths, list) and paths:
+            return "\n".join(f"- {path}" for path in paths if isinstance(path, str))
+        return "- none"
 
     def _should_repair(
         self,

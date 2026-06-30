@@ -13,6 +13,7 @@
 - v0.4 提供编辑评测入口，用临时 fixture 副本验证 agent 的受控修改能力。
 - v0.5 提供上下文统计、读取预算和项目索引工具，帮助 agent 先定位再按需读取文件。
 - v0.6 引入 `Plan → Execute → Verify` 运行协议，用确定性校验和最多一次 repair 管住编辑流程。
+- v0.6.1 Pending Approval 让普通非交互编辑任务只生成待审批补丁，不直接修改真实项目文件。
 
 ## 工具
 
@@ -22,8 +23,8 @@
 - `search_text(keyword)`：搜索 repo 内文本，返回文件名、行号和上下文行，跳过二进制文件、隐藏目录、`.git`、`node_modules`、`build`、`dist`。
 - `build_repo_index(force=False)`：构建或复用 `.repopilot/index/<repo_id>/file_index.json` 项目文件索引，记录路径、扩展名、行数、大小和 Python 顶层符号，跳过 `.git`、缓存和构建目录。
 - `inspect_repo()`：基于项目索引返回紧凑概览，包括主 Python 模块、测试文件、入口候选和大文件提示；项目分析、定位入口或准备修改代码时优先使用它。
-- `propose_patch(instruction, diff)`：保存 unified diff 补丁提案到 `.repopilot/patches`，返回 `patch_id`、预览和影响路径，不修改目标文件。
-- `apply_patch(patch_id)`：应用已保存补丁。CLI 模式会先显示补丁路径、影响路径、风险提示和补丁预览，只有用户明确批准后才会修改文件，并会先写入 `.repopilot/backups` 备份。
+- `propose_patch(instruction, diff)`：保存 unified diff 补丁提案到 `.repopilot/patches`，返回 `pending_approval`、`patch_id`、预览和影响路径，不修改目标文件。
+- `apply_patch(patch_id)`：确定性应用已保存的待审批补丁。普通 agent 循环不会自动调用它；用户需要通过 `python main.py patch apply --repo . <patch_id>` 审批，只有用户明确批准后才会修改文件，并会先写入 `.repopilot/backups` 备份。
 - `run_tests(command_name)`：执行白名单测试命令，只支持 `unit` 和 `compile`。`unit` 对应 `python -m unittest discover`，`compile` 对应 `python -m compileall .`。
 - `finish(answer)`：输出最终答案，答案应尽量引用文件名、函数名和行号。
 
@@ -95,6 +96,24 @@ python run_edit_eval.py --cases eval_cases/context_cases.json
 ```
 
 普通 CLI 的 `apply_patch` 仍然要求用户手动确认。`auto_for_eval` 只允许评测 runner 在带 marker 的临时 eval repo 中使用，不能用于真实项目或日常 CLI。
+
+## v0.6.1 Pending Approval
+
+v0.6.1 把普通非交互编辑任务固定为待审批流程：agent 可以生成补丁，但不会在真实项目中继续应用补丁或运行应用后的测试。`propose_patch(instruction, diff)` 成功后返回 `pending_approval` 和 `patch_id`，目标文件保持不变，最终答案会给出人工审查命令。
+
+常用 patch 子命令：
+
+```powershell
+python main.py patch list --repo .
+python main.py patch show --repo . <patch_id>
+python main.py patch show --repo . <patch_id> --full
+python main.py patch apply --repo . <patch_id>
+python main.py patch reject --repo . <patch_id>
+```
+
+`patch apply` 是确定性路径，不调用 LLM，也不执行任意 shell。应用前会校验 `patch.diff` 的 sha256、metadata 中的 path 和 `target_files` 是否一致，并检查目标文件当前内容是否仍匹配 `target_files[].sha256_before`。开始写入前会创建 `.repopilot/backups/<patch_id>` 备份；如果写入或白名单测试失败，会从备份回滚并记录 rollback 结果。应用后的测试只来自 metadata `plan_snapshot.test_commands`，并且只允许 `unit` 和 `compile` 两类白名单测试。
+
+评测仍使用带 marker 校验的临时 repo 和 `auto_for_eval`，用于避免自动评测被交互审批阻塞。真实 repo 和普通 CLI 不默认自动应用补丁；只有用户运行确定性 `patch apply` 审批后，才会按补丁内容修改文件。
 
 ## 配置
 
@@ -184,7 +203,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 }
 ```
 
-用户批准后才能应用补丁：
+用户通过确定性 patch CLI 审批后才会应用补丁；普通模型循环不要继续调用 `apply_patch`：
 
 ```json
 {
@@ -226,3 +245,4 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ## 替换 LLM 供应商
 
 替换不同模型供应商时，优先只修改 `llm_client.py`，保持 `LlmClient.chat(messages)` 返回模型文本即可。
+<!-- v0.6.1 Pending Approval -->

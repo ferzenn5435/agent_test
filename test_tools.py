@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import tempfile
 import unittest
@@ -815,6 +816,8 @@ class TestProposePatchV03(unittest.TestCase):
     def test_propose_patch_v03_saves_valid_diff_and_metadata(self) -> None:
         self.temp_repo_helper.create_text_file("file.txt", "old line\n")
         original_target = self.temp_repo_helper.read_text_file("file.txt")
+        original_file_path = self.temp_repo_helper.repo_root / "file.txt"
+        original_sha256 = hashlib.sha256(original_file_path.read_bytes()).hexdigest()
         instruction = "更新文件内容"
         diff_text = """diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old line\n+new line\n"""
 
@@ -828,19 +831,91 @@ class TestProposePatchV03(unittest.TestCase):
         self.assertTrue(patch_result["patch_id"])
         self.assertNotEqual("", patch_result["patch_path"])
         patch_path = self.temp_repo_helper.repo_root / str(patch_result["patch_path"])
-        metadata_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_result['patch_id']}.json"
+        patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches" / str(patch_result["patch_id"])
+        metadata_path = patch_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
+        self.assertEqual(patch_dir / "patch.diff", patch_path)
         self.assertEqual(diff_text, patch_path.read_text(encoding="utf-8"))
-        self.assertEqual("proposed", metadata["status"])
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_result['patch_id']}.patch").exists())
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_result['patch_id']}.json").exists())
+        self.assertEqual("pending_approval", metadata["status"])
         self.assertEqual(instruction, metadata["instruction"])
+        self.assertEqual("", metadata["run_id"])
+        self.assertEqual("", metadata["task"])
+        self.assertEqual("", metadata["summary"])
+        self.assertEqual("unknown", metadata["risk_level"])
+        self.assertIsNone(metadata["approved_at"])
+        self.assertIsNone(metadata["applied_at"])
+        self.assertIsNone(metadata["rejected_at"])
+        self.assertIsNone(metadata["plan_snapshot"])
         self.assertEqual(["file.txt"], metadata["paths"])
+        self.assertEqual(f".repopilot/patches/{patch_result['patch_id']}/patch.diff", metadata["diff_path"])
+        self.assertEqual(hashlib.sha256(diff_text.encode("utf-8")).hexdigest(), metadata["diff_sha256"])
+        self.assertEqual(
+            [
+                {
+                    "path": "file.txt",
+                    "existed_before": True,
+                    "sha256_before": original_sha256,
+                    "operation": "modify",
+                }
+            ],
+            metadata["target_files"],
+        )
         self.assertIn("需人工确认", "".join(metadata["warnings"]))
         self.assertIn("patch_id", patch_result)
         self.assertEqual([], patch_result["errors"])
         self.assertEqual(["file.txt"], patch_result["paths"])
+        self.assertEqual(metadata["target_files"], patch_result["target_files"])
+        self.assertTrue(patch_result["next_commands"])
         self.assertEqual(diff_text, patch_result["diff_preview"])
         self.assertEqual(original_target, self.temp_repo_helper.read_text_file("file.txt"))
+
+    def test_propose_patch_v03_accepts_optional_metadata_context(self) -> None:
+        diff_text = (
+            "diff --git a/new_file.txt b/new_file.txt\n"
+            "--- /dev/null\n"
+            "+++ b/new_file.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+created\n"
+        )
+
+        patch_result = self.repository_tools.propose_patch(
+            instruction="创建文件",
+            diff=diff_text,
+            run_id="run-1",
+            task="task-2",
+            summary="创建 new_file.txt",
+            plan_snapshot={"step": "保存补丁"},
+            risk_level="low",
+        )
+
+        self.assertTrue(patch_result["ok"])
+        metadata_path = (
+            self.temp_repo_helper.repo_root
+            / ".repopilot/patches"
+            / str(patch_result["patch_id"])
+            / "metadata.json"
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual("run-1", metadata["run_id"])
+        self.assertEqual("task-2", metadata["task"])
+        self.assertEqual("创建 new_file.txt", metadata["summary"])
+        self.assertEqual({"step": "保存补丁"}, metadata["plan_snapshot"])
+        self.assertEqual("low", metadata["risk_level"])
+        self.assertEqual(
+            [
+                {
+                    "path": "new_file.txt",
+                    "existed_before": False,
+                    "sha256_before": None,
+                    "operation": "create",
+                }
+            ],
+            metadata["target_files"],
+        )
+        self.assertFalse((self.temp_repo_helper.repo_root / "new_file.txt").exists())
 
     def test_propose_patch_v03_truncates_diff_preview(self) -> None:
         file_lines = [f"line {index + 1}" for index in range(130)]
@@ -866,6 +941,7 @@ class TestProposePatchV03(unittest.TestCase):
     def test_propose_patch_v03_rejects_invalid_diff_without_writing(self) -> None:
         patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
         existing_patch_files = list(patch_dir.glob("*.patch"))
+        existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
 
         patch_result = self.repository_tools.propose_patch(
             instruction="无效补丁",
@@ -875,12 +951,14 @@ class TestProposePatchV03(unittest.TestCase):
         self.assertFalse(patch_result["ok"])
         self.assertTrue(patch_result["errors"])
         self.assertEqual(existing_patch_files, list(patch_dir.glob("*.patch")))
+        self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
 
     def test_propose_patch_v03_rejects_hunk_body_count_mismatch_without_writing(self) -> None:
         self.temp_repo_helper.create_text_file("count_mismatch.txt", "one\ntwo\nthree\n")
         patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
         existing_patch_files = list(patch_dir.glob("*.patch"))
         existing_metadata_files = list(patch_dir.glob("*.json"))
+        existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
         diff_text = (
             "diff --git a/count_mismatch.txt b/count_mismatch.txt\n"
             "--- a/count_mismatch.txt\n"
@@ -911,6 +989,7 @@ class TestProposePatchV03(unittest.TestCase):
         )
         self.assertEqual(existing_patch_files, list(patch_dir.glob("*.patch")))
         self.assertEqual(existing_metadata_files, list(patch_dir.glob("*.json")))
+        self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
         self.assertEqual("one\ntwo\nthree\n", self.temp_repo_helper.read_text_file("count_mismatch.txt"))
 
     def test_propose_patch_v03_rejects_empty_inputs(self) -> None:
@@ -928,6 +1007,50 @@ class TestProposePatchV03(unittest.TestCase):
 
             self.assertFalse(patch_result["ok"])
             self.assertTrue(patch_result["errors"])
+
+    def test_propose_patch_rejects_empty_diff_without_storage_mutation(self) -> None:
+        patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
+        existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
+
+        patch_result = self.repository_tools.propose_patch(
+            instruction="空 diff",
+            diff="\n\t  ",
+        )
+
+        self.assertFalse(patch_result["ok"])
+        self.assertEqual(["diff must not be empty"], patch_result["errors"])
+        self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
+
+    def test_propose_patch_rejects_paths_with_spaces_without_storage_mutation(self) -> None:
+        patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
+        existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
+        diff_text = "diff --git a/space path.txt b/space path.txt\n--- a/space path.txt\n+++ b/space path.txt\n@@ -0,0 +1 @@\n+new\n"
+
+        patch_result = self.repository_tools.propose_patch(
+            instruction="path with spaces",
+            diff=diff_text,
+        )
+
+        self.assertFalse(patch_result["ok"])
+        errors_object = patch_result["errors"]
+        self.assertIsInstance(errors_object, list)
+        if not isinstance(errors_object, list):
+            self.fail("errors should be a list")
+        self.assertTrue(any("diff 缺少合法文件头" in str(error) for error in errors_object))
+        self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
+
+    def test_propose_patch_normalizes_windows_separators_in_targets(self) -> None:
+        self.temp_repo_helper.create_text_file("win/path.txt", "old\n")
+        diff_text = "diff --git a/win\\path.txt b/win\\path.txt\n--- a/win\\path.txt\n+++ b/win\\path.txt\n@@ -1 +1 @@\n-old\n+new\n"
+
+        patch_result = self.repository_tools.propose_patch(
+            instruction="windows separators",
+            diff=diff_text,
+        )
+
+        self.assertTrue(patch_result["ok"], patch_result)
+        self.assertEqual(["win/path.txt"], patch_result["paths"])
+        self.assertEqual("old\n", self.temp_repo_helper.read_text_file("win/path.txt"))
 
     def test_propose_patch_v03_appends_run_event(self) -> None:
         self.temp_repo_helper.create_text_file("run.txt", "old\n")
@@ -972,7 +1095,7 @@ class TestApplyPatchV03(unittest.TestCase):
         return str(patch_result["patch_id"])
 
     def _metadata(self, patch_id: str) -> dict[str, object]:
-        metadata_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.json"
+        metadata_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "metadata.json"
         return json.loads(metadata_path.read_text(encoding="utf-8"))
 
     def _run_events(self, patch_id: str) -> list[dict[str, object]]:
@@ -1015,7 +1138,16 @@ class TestApplyPatchV03(unittest.TestCase):
         metadata = self._metadata(patch_id)
         self.assertEqual("applied", metadata["status"])
         self.assertIn("applied_at", metadata)
+        self.assertEqual(
+            [{"command_name": None, "status": "skipped", "reason": "no test_commands"}],
+            metadata["verification_results"],
+        )
+        self.assertEqual(f".repopilot/backups/{patch_id}", metadata["backup_dir"])
         self.assertEqual(["src/existing.txt", "src/created.txt"], metadata["modified_files"])
+        manifest_path = self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(patch_id, manifest["patch_id"])
+        self.assertEqual(metadata["diff_sha256"], manifest["diff_sha256"])
         event_types = {event["event_type"] for event in self._run_events(patch_id)}
         self.assertIn("apply_start", event_types)
         self.assertIn("apply_success", event_types)
@@ -1046,20 +1178,164 @@ class TestApplyPatchV03(unittest.TestCase):
         diff_text = "diff --git a/state.txt b/state.txt\n--- a/state.txt\n+++ b/state.txt\n@@ -1 +1 @@\n-old\n+new\n"
         patch_id = self._propose_patch(diff_text)
         metadata = self._metadata(patch_id)
-        metadata["status"] = "accepted"
+        metadata["status"] = "proposed"
         self.repository_tools._write_patch_metadata(metadata)
         non_proposed_result = self.repository_tools.apply_patch(patch_id)
 
         self.assertFalse(non_proposed_result["ok"])
-        self.assertEqual(["only status=proposed patches can be applied"], non_proposed_result["errors"])
+        self.assertEqual(["only status=pending_approval patches can be applied or rejected"], non_proposed_result["errors"])
         self.assertEqual("old\n", self.temp_repo_helper.read_text_file("state.txt"))
         self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id).exists())
+
+    def test_show_patch_lists_preview_and_full_diff(self) -> None:
+        self.temp_repo_helper.create_text_file("show.txt", "old\n")
+        diff_text = "diff --git a/show.txt b/show.txt\n--- a/show.txt\n+++ b/show.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+
+        list_result = self.repository_tools.list_patches()
+        preview_result = self.repository_tools.show_patch(patch_id)
+        full_result = self.repository_tools.show_patch(patch_id, full=True)
+
+        self.assertTrue(list_result["ok"])
+        patches = list_result["patches"]
+        self.assertIsInstance(patches, list)
+        if not isinstance(patches, list):
+            self.fail("patches should be a list")
+        self.assertEqual([patch_id], [patch["patch_id"] for patch in patches if isinstance(patch, dict)])
+        self.assertTrue(preview_result["ok"])
+        self.assertEqual(diff_text, preview_result["diff_preview"])
+        self.assertEqual("", preview_result["diff"])
+        self.assertTrue(full_result["ok"])
+        self.assertEqual(diff_text, full_result["diff"])
+        self.assertEqual("", full_result["diff_preview"])
+
+    def test_apply_patch_rejects_sha256_tamper_without_metadata_mutation(self) -> None:
+        self.temp_repo_helper.create_text_file("tamper.txt", "old\n")
+        diff_text = "diff --git a/tamper.txt b/tamper.txt\n--- a/tamper.txt\n+++ b/tamper.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+        patch_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "patch.diff"
+        patch_path.write_text(
+            "diff --git a/tamper.txt b/tamper.txt\n--- a/tamper.txt\n+++ b/tamper.txt\n@@ -1 +1 @@\n-old\n+evil\n",
+            encoding="utf-8",
+        )
+
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual(["patch.diff sha256 does not match metadata.diff_sha256"], apply_result["errors"])
+        self.assertEqual("old\n", self.temp_repo_helper.read_text_file("tamper.txt"))
+        self.assertEqual("pending_approval", self._metadata(patch_id)["status"])
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id).exists())
+
+    def test_apply_patch_rejects_metadata_target_mismatch_before_write(self) -> None:
+        self.temp_repo_helper.create_text_file("target.txt", "old\n")
+        diff_text = "diff --git a/target.txt b/target.txt\n--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+        metadata = self._metadata(patch_id)
+        metadata["target_files"] = [
+            {"path": "other.txt", "existed_before": False, "sha256_before": None, "operation": "create"}
+        ]
+        self.repository_tools._write_patch_metadata(metadata)
+
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual(["metadata.target_files paths do not match patch.diff targets"], apply_result["errors"])
+        self.assertEqual("old\n", self.temp_repo_helper.read_text_file("target.txt"))
+        self.assertEqual("pending_approval", self._metadata(patch_id)["status"])
+
+    def test_apply_patch_rejects_stale_modify_sha_before_backup_or_write(self) -> None:
+        self.temp_repo_helper.create_text_file("stale.txt", "old\n")
+        diff_text = "diff --git a/stale.txt b/stale.txt\n--- a/stale.txt\n+++ b/stale.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+        self.temp_repo_helper.create_text_file("stale.txt", "old but changed\n")
+
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual("rejected", apply_result["status"])
+        self.assertEqual(
+            ["metadata target state mismatch: stale.txt sha256_before does not match current file"],
+            apply_result["errors"],
+        )
+        self.assertEqual("old but changed\n", self.temp_repo_helper.read_text_file("stale.txt"))
+        self.assertEqual("pending_approval", self._metadata(patch_id)["status"])
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id).exists())
+
+    def test_apply_patch_rejects_create_target_that_now_exists_before_backup_or_write(self) -> None:
+        diff_text = (
+            "diff --git a/new_existing.txt b/new_existing.txt\n"
+            "--- /dev/null\n"
+            "+++ b/new_existing.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+created\n"
+        )
+        patch_id = self._propose_patch(diff_text)
+        self.temp_repo_helper.create_text_file("new_existing.txt", "already here\n")
+
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual("rejected", apply_result["status"])
+        self.assertTrue(apply_result["errors"])
+        self.assertEqual("already here\n", self.temp_repo_helper.read_text_file("new_existing.txt"))
+        self.assertEqual("pending_approval", self._metadata(patch_id)["status"])
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id).exists())
+
+    def test_apply_patch_rejects_missing_modify_target_before_backup_or_write(self) -> None:
+        diff_text = (
+            "diff --git a/missing_modify.txt b/missing_modify.txt\n"
+            "--- /dev/null\n"
+            "+++ b/missing_modify.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+created\n"
+        )
+        patch_id = self._propose_patch(diff_text)
+        metadata = self._metadata(patch_id)
+        metadata["target_files"] = [
+            {
+                "path": "missing_modify.txt",
+                "existed_before": True,
+                "sha256_before": "0" * 64,
+                "operation": "modify",
+            }
+        ]
+        self.repository_tools._write_patch_metadata(metadata)
+
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual("rejected", apply_result["status"])
+        self.assertEqual(
+            ["metadata target state mismatch: missing_modify.txt modify target is missing"],
+            apply_result["errors"],
+        )
+        self.assertFalse((self.temp_repo_helper.repo_root / "missing_modify.txt").exists())
+        self.assertEqual("pending_approval", self._metadata(patch_id)["status"])
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/backups" / patch_id).exists())
+
+    def test_reject_patch_blocks_later_apply_without_business_file_changes(self) -> None:
+        self.temp_repo_helper.create_text_file("reject_me.txt", "old\n")
+        diff_text = "diff --git a/reject_me.txt b/reject_me.txt\n--- a/reject_me.txt\n+++ b/reject_me.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+
+        reject_result = self.repository_tools.reject_patch(patch_id)
+        apply_result = self.repository_tools.apply_patch(patch_id)
+
+        self.assertTrue(reject_result["ok"])
+        self.assertEqual("rejected", reject_result["status"])
+        metadata = self._metadata(patch_id)
+        self.assertEqual("rejected", metadata["status"])
+        self.assertIsNotNone(metadata["rejected_at"])
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual(["only status=pending_approval patches can be applied or rejected"], apply_result["errors"])
+        self.assertEqual("old\n", self.temp_repo_helper.read_text_file("reject_me.txt"))
 
     def test_apply_patch_revalidates_saved_diff_and_rejects_raw_diff_args(self) -> None:
         self.temp_repo_helper.create_text_file("safe.txt", "old\n")
         diff_text = "diff --git a/safe.txt b/safe.txt\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-old\n+new\n"
         patch_id = self._propose_patch(diff_text)
-        patch_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.patch"
+        patch_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "patch.diff"
         patch_path.write_text("not a unified diff\n", encoding="utf-8")
 
         invalid_saved_result = self.repository_tools.apply_patch(patch_id)
@@ -1071,7 +1347,7 @@ class TestApplyPatchV03(unittest.TestCase):
                 {"tool": "apply_patch", "args": {"patch_id": patch_id, "diff": diff_text}}
             )
 
-    def test_apply_patch_reports_hunk_content_mismatch_clearly(self) -> None:
+    def test_apply_patch_reports_current_state_mismatch_clearly(self) -> None:
         self.temp_repo_helper.create_text_file("mismatch.txt", "current\n")
         diff_text = "diff --git a/mismatch.txt b/mismatch.txt\n--- a/mismatch.txt\n+++ b/mismatch.txt\n@@ -1 +1 @@\n-current\n+patched\n"
         patch_id = self._propose_patch(diff_text)
@@ -1081,7 +1357,10 @@ class TestApplyPatchV03(unittest.TestCase):
 
         self.assertFalse(apply_result["ok"])
         self.assertEqual("rejected", apply_result["status"])
-        self.assertEqual(["hunk content mismatch: mismatch.txt line 1"], apply_result["errors"])
+        self.assertEqual(
+            ["metadata target state mismatch: mismatch.txt sha256_before does not match current file"],
+            apply_result["errors"],
+        )
         self.assertEqual("changed before apply\n", self.temp_repo_helper.read_text_file("mismatch.txt"))
 
     def test_apply_patch_rolls_back_existing_and_new_files_after_partial_write_failure(self) -> None:
@@ -1131,10 +1410,20 @@ class TestApplyPatchV03(unittest.TestCase):
 
         self.assertFalse(apply_result["ok"])
         self.assertEqual("failed", apply_result["status"])
-        self.assertEqual({"attempted": True, "ok": True, "errors": []}, apply_result["rollback"])
+        rollback_result = apply_result["rollback"]
+        self.assertIsInstance(rollback_result, dict)
+        if not isinstance(rollback_result, dict):
+            self.fail("rollback should be a dict")
+        self.assertEqual(True, rollback_result["attempted"])
+        self.assertEqual(True, rollback_result["ok"])
+        self.assertEqual([], rollback_result["errors"])
+        self.assertTrue(rollback_result["files"])
         self.assertEqual("old first\n", self.temp_repo_helper.read_text_file("first.txt"))
         self.assertEqual("old second\n", self.temp_repo_helper.read_text_file("second.txt"))
         self.assertFalse((self.temp_repo_helper.repo_root / "created_after_failure.txt").exists())
+        metadata = self._metadata(patch_id)
+        self.assertEqual("failed", metadata["status"])
+        self.assertEqual(rollback_result, metadata["rollback"])
         run_events = self._run_events(patch_id)
         event_types = {event["event_type"] for event in run_events}
         self.assertIn("apply_failure", event_types)
@@ -1146,18 +1435,53 @@ class TestApplyPatchV03(unittest.TestCase):
                 event.get("event_type") == "apply_failure"
                 and event.get("status") == "failed"
                 and isinstance(details, dict)
-                and details.get("rollback") == {"attempted": True, "ok": True, "errors": []}
+                and isinstance(details.get("rollback"), dict)
+                and details["rollback"].get("attempted") is True
+                and details["rollback"].get("ok") is True
             ):
                 apply_failure_found = True
         self.assertTrue(apply_failure_found)
-        self.assertTrue(
-            any(
+        rollback_success_found = False
+        for event in run_events:
+            details = event.get("details")
+            if not isinstance(details, dict):
+                continue
+            if (
                 event["event_type"] == "rollback_success"
                 and event["status"] == "ok"
-                and event["details"] == {"errors": []}
-                for event in run_events
-            )
+                and details.get("errors") == []
+                and isinstance(details.get("files"), list)
+            ):
+                rollback_success_found = True
+        self.assertTrue(rollback_success_found)
+
+    def test_apply_patch_rolls_back_when_whitelist_test_fails(self) -> None:
+        self.temp_repo_helper.create_text_file("verify.txt", "old\n")
+        diff_text = "diff --git a/verify.txt b/verify.txt\n--- a/verify.txt\n+++ b/verify.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        patch_id = self._propose_patch(diff_text)
+        metadata = self._metadata(patch_id)
+        metadata["plan_snapshot"] = {"test_commands": [{"command_name": "unit"}]}
+        self.repository_tools._write_patch_metadata(metadata)
+
+        with mock.patch.object(
+            self.repository_tools,
+            "run_tests",
+            return_value={"command_name": "unit", "exit_code": 1, "stdout": "fail", "stderr": "", "timed_out": False},
+        ) as mocked_run_tests:
+            apply_result = self.repository_tools.apply_patch(patch_id)
+
+        mocked_run_tests.assert_called_once_with("unit")
+        self.assertFalse(apply_result["ok"])
+        self.assertEqual("failed", apply_result["status"])
+        self.assertEqual(["patch verification failed"], apply_result["errors"])
+        self.assertEqual("old\n", self.temp_repo_helper.read_text_file("verify.txt"))
+        self.assertEqual(
+            [{"command_name": "unit", "status": "failed", "exit_code": 1, "timed_out": False, "stdout": "fail", "stderr": ""}],
+            apply_result["verification_results"],
         )
+        failed_metadata = self._metadata(patch_id)
+        self.assertEqual("failed", failed_metadata["status"])
+        self.assertEqual(apply_result["verification_results"], failed_metadata["verification_results"])
 
 
 class TestRepositoryToolsV03Storage(unittest.TestCase):
@@ -1198,14 +1522,24 @@ class TestRepositoryToolsV03Storage(unittest.TestCase):
         metadata_path = self.repository_tools._write_patch_metadata(metadata)
 
         self.assertRegex(patch_id, r"^\d{8}_\d{6}_[0-9a-f]{12}$")
-        self.assertEqual(patch_path.name, f"{patch_id}.patch")
-        self.assertEqual(metadata_path.name, f"{patch_id}.json")
+        self.assertEqual(patch_path.name, "patch.diff")
+        self.assertEqual(patch_path.parent.name, patch_id)
+        self.assertEqual(metadata_path.name, "metadata.json")
+        self.assertEqual(metadata_path.parent.name, patch_id)
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.patch").exists())
+        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.json").exists())
         self.assertEqual(patch_text, self.repository_tools._read_patch_file(patch_id))
         self.assertEqual(metadata, self.repository_tools._read_patch_metadata(patch_id))
         self.assertEqual(patch_id, metadata["patch_id"])
         self.assertEqual("更新 example.txt", metadata["instruction"])
-        self.assertEqual("proposed", metadata["status"])
+        self.assertEqual("pending_approval", metadata["status"])
         self.assertEqual(["example.txt"], metadata["paths"])
+        self.assertEqual([], metadata["target_files"])
+        self.assertEqual("", metadata["diff_path"])
+        self.assertEqual("", metadata["diff_sha256"])
+        self.assertIsNone(metadata["approved_at"])
+        self.assertIsNone(metadata["applied_at"])
+        self.assertIsNone(metadata["rejected_at"])
         self.assertEqual(["人工确认后应用"], metadata["warnings"])
         self.assertIn("created_at", metadata)
 

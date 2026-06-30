@@ -7,11 +7,12 @@ from dataclasses import dataclass, replace
 from schemas import TaskPlan, VerificationResult
 
 
-LEGAL_STAGES = {"INIT", "PLAN", "EXECUTE", "VERIFY", "REPAIR", "FINISH"}
+LEGAL_STAGES = {"INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "VERIFY", "REPAIR", "FINISH"}
 LEGAL_TRANSITIONS = {
     "INIT": {"PLAN"},
     "PLAN": {"EXECUTE"},
-    "EXECUTE": {"VERIFY"},
+    "EXECUTE": {"AWAITING_APPROVAL", "VERIFY"},
+    "AWAITING_APPROVAL": {"FINISH"},
     "VERIFY": {"REPAIR", "FINISH"},
     "REPAIR": {"EXECUTE"},
     "FINISH": set(),
