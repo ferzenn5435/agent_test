@@ -118,6 +118,8 @@ def _parse_plan_steps(raw_steps: object) -> tuple[PlanStep, ...]:
 
 def _parse_must_contain_rules(raw_rules: object) -> tuple[MustContainRule, ...]:
     """Parse must_contain rules from a raw JSON list."""
+    if isinstance(raw_rules, dict):
+        raw_rules = [raw_rules]
     if not isinstance(raw_rules, list):
         raise PlannerError("must_contain must be a list")
 

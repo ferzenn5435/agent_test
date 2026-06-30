@@ -817,6 +817,99 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertFalse(tool_result["ok"])
             self.assertIn("plan_step_id", str(tool_result["error"]))
 
+    def test_planner_error_returns_readable_failure_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            invalid_plan = json.dumps(
+                {
+                    "task_type": "edit",
+                    "risk_level": "low",
+                    "max_steps": 4,
+                    "requires_patch": True,
+                    "requires_tests": False,
+                    "expected_changed_files": ["README.md"],
+                    "steps": [{"id": "step1", "title": "编辑 README"}],
+                    "verification": [{"must_contain": "README"}],
+                },
+                ensure_ascii=False,
+            )
+            fake_llm = FakeLlmClient([invalid_plan], prepend_plan=False)
+            fake_logger = FakeRunLogger()
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=4,
+            )
+
+            final_answer = agent.answer("生成非法 plan")
+
+            self.assertIn("PLAN 阶段失败", final_answer)
+            self.assertEqual(final_answer, fake_logger.error)
+            self.assertEqual(final_answer, fake_logger.final_answer)
+            self.assertEqual([], fake_logger.steps)
+
+    def test_planner_error_records_plan_stage_in_real_logger(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            log_dir = repo_path / "logs"
+            invalid_plan = json.dumps(
+                {
+                    "task_type": "edit",
+                    "risk_level": "low",
+                    "max_steps": 4,
+                    "requires_patch": True,
+                    "requires_tests": False,
+                    "expected_changed_files": ["README.md"],
+                    "steps": [{"id": "step1", "title": "编辑 README"}],
+                    "verification": [{"must_contain": "README"}],
+                },
+                ensure_ascii=False,
+            )
+            run_logger = RunLogger(repo_path, "生成非法 plan", log_dir=log_dir)
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, FakeLlmClient([invalid_plan], prepend_plan=False)),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=4,
+            )
+
+            final_answer = agent.answer("生成非法 plan")
+
+            self.assertIn("PLAN 阶段失败", final_answer)
+            self.assertEqual("PLAN", run_logger.payload["stage"])
+            self.assertEqual(["INIT", "PLAN"], run_logger.payload["stage_history"])
+            self.assertEqual(final_answer, run_logger.payload["error"])
+            self.assertEqual(final_answer, run_logger.payload["final_answer"])
+
+    def test_execute_prompt_lists_actual_plan_step_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            custom_plan = _task_plan_json(step_id="step1")
+            fake_llm = FakeLlmClient(
+                [
+                    custom_plan,
+                    _agent_tool_call("finish", {"answer": "完成"}, plan_step_id="step1"),
+                ],
+                prepend_plan=False,
+            )
+            fake_logger = FakeRunLogger()
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=4,
+            )
+
+            final_answer = agent.answer("说明流程")
+
+            _assert_v06_summary(self, final_answer, "完成")
+            execute_messages = fake_llm.messages_by_call[1]
+            execute_prompt = "\n".join(message["content"] for message in execute_messages)
+            self.assertIn("有效 plan_step_id", execute_prompt)
+            self.assertIn("step1", execute_prompt)
+            self.assertNotIn("step-1。", execute_prompt)
+
     def test_unknown_plan_step_id_rejects_before_tool_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
@@ -839,7 +932,10 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertEqual([], tool_calls)
             tool_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
             self.assertFalse(tool_result["ok"])
-            self.assertIn("未知 plan_step_id", str(tool_result["error"]))
+            error_message = str(tool_result["error"])
+            self.assertIn("未知 plan_step_id", error_message)
+            self.assertIn("有效 plan_step_id", error_message)
+            self.assertIn("step-1", error_message)
 
     def test_apply_patch_before_successful_propose_rejects_before_tool_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

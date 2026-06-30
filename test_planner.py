@@ -325,6 +325,22 @@ class TestBuildTaskPlanFromDict(unittest.TestCase):
         self.assertEqual(3, len(plan.steps))
         self.assertEqual(1, len(plan.verification))
 
+    def test_accepts_single_must_contain_object_from_llm(self) -> None:
+        raw: dict[str, object] = dict(
+            VALID_EDIT_JSON,
+            verification=[
+                {
+                    "must_contain": {"path": "src/core.py", "strings": ["def run"]},
+                }
+            ],
+        )
+
+        plan = _build_task_plan_from_dict(raw, max_steps=5)
+
+        self.assertEqual(1, len(plan.verification))
+        self.assertEqual(1, len(plan.verification[0].must_contain))
+        self.assertEqual("src/core.py", plan.verification[0].must_contain[0].path)
+
     def test_builds_valid_analysis_plan(self) -> None:
         plan = _build_task_plan_from_dict(VALID_ANALYSIS_JSON, max_steps=8)
         self.assertIsInstance(plan, TaskPlan)

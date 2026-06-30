@@ -13,7 +13,7 @@ from logger import RunLogger
 import planner
 from prompts import build_system_prompt
 from run_state import RunState
-from schemas import VerificationResult
+from schemas import TaskPlan, VerificationResult
 from tools import RepositoryTools, ToolError
 import verifier
 
@@ -66,6 +66,7 @@ class CodeAnalysisAgent:
         try:
             inspect_repo_result = self._inspect_repo_safely()
             run_state = run_state.transition("PLAN")
+            self._update_logger_state_payload(run_state, verify_status=None)
             plan = planner.create_plan(
                 question,
                 inspect_repo_result,
@@ -75,6 +76,12 @@ class CodeAnalysisAgent:
             run_state = run_state.with_plan(plan)
             self._update_logger_state_payload(run_state, verify_status=None)
             run_state = run_state.transition("EXECUTE")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._format_execute_stage_instructions(plan),
+                }
+            )
 
             step_limit = min(self.max_steps, plan.max_steps)
             step_number = 1
@@ -228,6 +235,12 @@ class CodeAnalysisAgent:
                     )
                 )
                 step_number += 1
+        except planner.PlannerError as error:
+            final_answer = f"PLAN 阶段失败: {error}"
+            self.run_logger.set_context_stats(context_stats.to_dict())
+            self.run_logger.set_error(final_answer)
+            self.run_logger.set_final_answer(final_answer)
+            return final_answer
         except Exception:
             self.run_logger.set_context_stats(context_stats.to_dict())
             raise
@@ -290,9 +303,28 @@ class CodeAnalysisAgent:
             return "执行前缺少 plan"
         legal_step_ids = {step.id for step in plan.steps}
         if raw_plan_step_id.strip() not in legal_step_ids:
-            return f"未知 plan_step_id: {raw_plan_step_id}"
+            valid_ids = ", ".join(sorted(legal_step_ids))
+            return f"未知 plan_step_id: {raw_plan_step_id}；有效 plan_step_id: {valid_ids}"
         tool_call["plan_step_id"] = raw_plan_step_id.strip()
         return None
+
+    def _format_execute_stage_instructions(self, plan: TaskPlan) -> str:
+        plan_dict = plan.to_dict()
+        valid_step_ids = []
+        if isinstance(plan_dict, dict):
+            raw_steps = plan_dict.get("steps")
+            if isinstance(raw_steps, list):
+                for raw_step in raw_steps:
+                    if isinstance(raw_step, dict) and isinstance(raw_step.get("id"), str):
+                        valid_step_ids.append(raw_step["id"])
+        return (
+            "PLAN 已生成，进入 EXECUTE 阶段。\n"
+            "必须只输出严格 JSON: {\"thought\": \"...\", \"plan_step_id\": \"...\", "
+            "\"tool\": \"...\", \"args\": {}}。\n"
+            f"有效 plan_step_id 只能从这些值中选择: {', '.join(valid_step_ids)}。\n"
+            "不要再次输出 plan/steps；完成分析或操作后必须调用 finish。\n"
+            f"TaskPlan:\n{json.dumps(plan_dict, ensure_ascii=False, indent=2)}"
+        )
 
     def _validate_patch_sequence(
         self,
