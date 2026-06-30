@@ -24,5 +24,19 @@
     "must_not_read_full_files": ["large_notes.md"],
     "max_total_tool_output_chars": 12000,
     "test_command": "unit"
+  },
+  {
+    "id": "verify-context-budget-still-enforced",
+    "fixture": "tests/fixtures/medium_python_project",
+    "prompt": "按计划找出发票摘要相关代码的位置，并保持上下文预算：不要完整读取 large_notes.md，最后说明定位结果。",
+    "max_steps": 6,
+    "allowed_changed_files": [],
+    "must_contain": [],
+    "must_not_read_full_files": ["large_notes.md"],
+    "max_total_tool_output_chars": 12000,
+    "must_have_plan": true,
+    "required_stages": ["PLAN", "EXECUTE", "VERIFY", "FINISH"],
+    "must_reference_plan_steps": true,
+    "max_repair_attempts": 0
   }
 ]

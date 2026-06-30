@@ -646,11 +646,11 @@ class RepositoryToolsTest(unittest.TestCase):
         self.assertIn("13 | class ContextStats:", file_content)
 
     def test_search_text_finds_max_steps_with_context(self) -> None:
-        matches = self.repository_tools.search_text("MAX_STEPS")
+        matches = self.repository_tools.search_text("MAX_STEPS", path_glob="config.py")
 
         self.assertTrue(matches)
         self.assertTrue(
-            any("agent.py:" in match and "MAX_STEPS" in match for match in matches)
+            any("config.py:" in match and "MAX_STEPS" in match for match in matches)
         )
         self.assertTrue(any(" | " in match for match in matches))
 

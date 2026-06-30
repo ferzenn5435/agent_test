@@ -49,17 +49,30 @@ V05_TOOL_DESCRIPTIONS = "\n".join(
 class FakeLlmClient:
     """按顺序返回内容并记录每次收到的 messages。"""
 
-    def __init__(self, outputs: Sequence[str | Callable[[list[dict[str, str]]], str]]) -> None:
-        self.outputs = list(outputs)
+    def __init__(
+        self,
+        outputs: Sequence[str | Callable[[list[dict[str, str]]], str]],
+        prepend_plan: bool = True,
+    ) -> None:
+        self.prepend_plan = prepend_plan
+        self.outputs: list[str | Callable[[list[dict[str, str]]], str]] = (
+            [*_default_plan_outputs()] if prepend_plan else []
+        )
+        self.outputs.extend(outputs)
         self.messages_by_call: list[list[dict[str, str]]] = []
-        self.call_count = 0
+        self._call_count = 0
+
+    @property
+    def call_count(self) -> int:
+        plan_overhead = len(_default_plan_outputs()) if self.prepend_plan else 0
+        return max(0, self._call_count - plan_overhead)
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         self.messages_by_call.append([dict(message) for message in messages])
-        if self.call_count >= len(self.outputs):
+        if self._call_count >= len(self.outputs):
             raise AssertionError("fake LLM 没有更多输出")
-        output = self.outputs[self.call_count]
-        self.call_count += 1
+        output = self.outputs[self._call_count]
+        self._call_count += 1
         if callable(output):
             return output(messages)
         return output
@@ -100,15 +113,61 @@ class FakeRunLogger:
         self.context_stats = dict(stats)
 
 
-def _agent_tool_call(tool: str, args: dict[str, object]) -> str:
+def _default_plan_outputs() -> list[str]:
+    return [_task_plan_json()]
+
+
+def _task_plan_json(
+    step_id: str = "step-1",
+    task_type: str = "analysis",
+    requires_patch: bool = False,
+    requires_tests: bool = False,
+    expected_changed_files: Sequence[str] = (),
+) -> str:
+    verification: list[dict[str, object]] = []
+    if task_type in {"edit", "refactor"}:
+        verification = [{"must_contain": [{"path": "sample.py", "strings": ["ok"]}]}]
     return json.dumps(
         {
-            "thought": f"调用 {tool}",
-            "tool": tool,
-            "args": args,
+            "task_type": task_type,
+            "risk_level": "low",
+            "max_steps": 8,
+            "requires_patch": requires_patch,
+            "requires_tests": requires_tests,
+            "expected_changed_files": list(expected_changed_files),
+            "steps": [{"id": step_id, "title": "执行任务", "description": "测试计划"}],
+            "verification": verification,
         },
         ensure_ascii=False,
     )
+
+
+def _agent_tool_call(
+    tool: str,
+    args: dict[str, object],
+    plan_step_id: str | None = "step-1",
+) -> str:
+    tool_call: dict[str, object] = {
+        "thought": f"调用 {tool}",
+        "tool": tool,
+        "args": args,
+    }
+    if plan_step_id is not None:
+        tool_call["plan_step_id"] = plan_step_id
+    return json.dumps(tool_call, ensure_ascii=False)
+
+
+def _assert_v06_summary(test_case: unittest.TestCase, final_answer: str, prefix: str) -> None:
+    test_case.assertTrue(final_answer.startswith(prefix), final_answer)
+    for expected_text in [
+        "v0.6 summary:",
+        "execution steps:",
+        "changed files:",
+        "tests:",
+        "verification:",
+        "repair:",
+    ]:
+        test_case.assertIn(expected_text, final_answer)
 
 
 class MainParserTest(unittest.TestCase):
@@ -190,6 +249,70 @@ class TestPromptV03SafetyFlow(unittest.TestCase):
         self.assertIn("禁止使用 LangChain、LangGraph、LlamaIndex", self.prompt)
         self.assertIn("禁止 MCP", self.prompt)
         self.assertIn("禁止多 agent", self.prompt)
+
+    def test_v06_protocol_separates_plan_execute_verify_and_final_answer(self) -> None:
+        for expected_text in [
+            "PLAN",
+            "EXECUTE",
+            "VERIFY",
+            "TaskPlan",
+            "严格 TaskPlan JSON",
+            "plan_step_id",
+            "deterministic program verification",
+            "确定性程序验证",
+            "repair",
+            "plan steps",
+            "changed files",
+            "tests",
+            "verification",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.prompt)
+
+
+class TestReadmeDocumentation(unittest.TestCase):
+    """验证 README 保留关键版本说明。"""
+
+    def setUp(self) -> None:
+        readme_path = Path(__file__).resolve().with_name("README.md")
+        self.readme_text = readme_path.read_text(encoding="utf-8")
+
+    def test_v06_plan_execute_verify_section_documents_protocol(self) -> None:
+        for expected_text in [
+            "Plan → Execute → Verify",
+            "不是多 agent",
+            "PLAN",
+            "TaskPlan",
+            "EXECUTE",
+            "{thought, plan_step_id, tool, args}",
+            "VERIFY",
+            "plan steps",
+            "changed files",
+            "tests",
+            "verification",
+            "repair 最多 1 次",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_v06_readme_keeps_eval_commands_and_v05_section(self) -> None:
+        for expected_text in [
+            "python -m unittest discover",
+            "python run_edit_eval.py --cases eval_cases/edit_cases.json",
+            "python run_edit_eval.py --cases eval_cases/context_cases.json",
+            "普通 CLI 的 `apply_patch` 仍然要求用户手动确认",
+            "`auto_for_eval` 只允许评测 runner 在带 marker 的临时 eval repo 中使用",
+            "v0.5 上下文管理与项目索引",
+        ]:
+            with self.subTest(expected_text=expected_text):
+                self.assertIn(expected_text, self.readme_text)
+
+    def test_model_output_examples_include_plan_step_id(self) -> None:
+        self.assertIn(
+            "`plan_step_id` 必须来自 `TaskPlan.steps`",
+            self.readme_text,
+        )
+        self.assertEqual(6, self.readme_text.count('"plan_step_id": "step-1"'))
 
 
 class TestMainApplyApproval(unittest.TestCase):
@@ -587,7 +710,7 @@ class TestAgentContextV05(unittest.TestCase):
 
             final_answer = agent.answer("读取四个文件后完成")
 
-            self.assertEqual("完成", final_answer)
+            _assert_v06_summary(self, final_answer, "完成")
             self.assertEqual(5, fake_llm.call_count)
             last_messages = fake_llm.messages_by_call[-1]
             compact_messages = [
@@ -643,7 +766,7 @@ class TestAgentContextV05(unittest.TestCase):
 
             final_answer = agent.answer("统计上下文")
 
-            self.assertEqual("完成", final_answer)
+            _assert_v06_summary(self, final_answer, "完成")
             context_stats = agent.context_stats.to_dict()
             self.assertEqual(5, context_stats["steps_used"])
             self.assertEqual(["pkg/sample.py"], context_stats["files_read"])
@@ -669,6 +792,79 @@ class TestAgentContextV05(unittest.TestCase):
             )
             self.assertGreater(cast(int, context_stats["messages_total_chars"]), 0)
 
+    def test_missing_plan_step_id_rejects_before_tool_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            fake_llm = FakeLlmClient(
+                [_agent_tool_call("list_dir", {"path": "."}, plan_step_id=None)]
+            )
+            fake_logger = FakeRunLogger()
+            tool_calls: list[dict[str, object]] = []
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=1,
+                tool_runner=lambda tool_call: tool_calls.append(tool_call),
+            )
+
+            final_answer = agent.answer("缺少 plan_step_id")
+
+            self.assertIn("达到最大循环步数 1", final_answer)
+            self.assertEqual([], tool_calls)
+            self.assertEqual(1, len(fake_logger.steps))
+            tool_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
+            self.assertFalse(tool_result["ok"])
+            self.assertIn("plan_step_id", str(tool_result["error"]))
+
+    def test_unknown_plan_step_id_rejects_before_tool_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            fake_llm = FakeLlmClient(
+                [_agent_tool_call("list_dir", {"path": "."}, plan_step_id="missing-step")]
+            )
+            fake_logger = FakeRunLogger()
+            tool_calls: list[dict[str, object]] = []
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=1,
+                tool_runner=lambda tool_call: tool_calls.append(tool_call),
+            )
+
+            final_answer = agent.answer("未知 plan_step_id")
+
+            self.assertIn("达到最大循环步数 1", final_answer)
+            self.assertEqual([], tool_calls)
+            tool_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
+            self.assertFalse(tool_result["ok"])
+            self.assertIn("未知 plan_step_id", str(tool_result["error"]))
+
+    def test_apply_patch_before_successful_propose_rejects_before_tool_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            fake_llm = FakeLlmClient(
+                [_agent_tool_call("apply_patch", {"patch_id": "20260629_010203_abcdef123456"})]
+            )
+            fake_logger = FakeRunLogger()
+            tool_calls: list[dict[str, object]] = []
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=cast(RunLogger, fake_logger),
+                max_steps=1,
+                tool_runner=lambda tool_call: tool_calls.append(tool_call),
+            )
+
+            final_answer = agent.answer("禁止直接 apply")
+
+            self.assertIn("达到最大循环步数 1", final_answer)
+            self.assertEqual([], tool_calls)
+            tool_result = cast(dict[str, object], fake_logger.steps[0]["tool_result"])
+            self.assertFalse(tool_result["ok"])
+            self.assertIn("propose_patch", str(tool_result["error"]))
+
     def test_logger_writes_context_stats_on_finish(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
@@ -691,7 +887,7 @@ class TestAgentContextV05(unittest.TestCase):
 
             final_answer = finish_agent.answer("读取后完成")
 
-            self.assertEqual("完成", final_answer)
+            _assert_v06_summary(self, final_answer, "完成")
             self.assertEqual(finish_agent.context_stats.to_dict(), finish_logger.context_stats)
             self.assertEqual(2, cast(dict[str, object], finish_logger.context_stats)["steps_used"])
 
@@ -711,6 +907,145 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertIn("达到最大循环步数 1", max_steps_answer)
             self.assertEqual(max_steps_agent.context_stats.to_dict(), max_steps_logger.context_stats)
             self.assertEqual(1, cast(dict[str, object], max_steps_logger.context_stats)["steps_used"])
+
+    def test_payload_records_verify_after_successful_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "sample.py").write_text("print('ok')\n", encoding="utf-8")
+            run_logger = RunLogger(repo_path=repo_path, user_task="verify payload", log_dir=repo_path / "logs")
+            agent = CodeAnalysisAgent(
+                llm_client=cast(
+                    LlmClient,
+                    FakeLlmClient(
+                        [
+                            _agent_tool_call("read_file", {"path": "sample.py"}),
+                            _agent_tool_call("finish", {"answer": "完成"}),
+                        ]
+                    ),
+                ),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=2,
+            )
+
+            final_answer = agent.answer("直接完成")
+
+            _assert_v06_summary(self, final_answer, "完成")
+            self.assertEqual(["INIT", "PLAN", "EXECUTE", "VERIFY", "FINISH"], run_logger.payload["stage_history"])
+            self.assertEqual("FINISH", run_logger.payload["stage"])
+            self.assertIsInstance(run_logger.payload["plan"], dict)
+            self.assertEqual("step-1", run_logger.payload["plan_step_id"])
+            steps = cast(list[dict[str, object]], run_logger.payload["steps"])
+            self.assertEqual("step-1", steps[0]["plan_step_id"])
+            verify_status = cast(dict[str, object], run_logger.payload["verify_status"])
+            self.assertTrue(verify_status["passed"])
+            self.assertEqual(0, run_logger.payload["repair_attempt"])
+            self.assertEqual(0, run_logger.payload["repair_attempts"])
+
+    def test_tests_failed_verification_triggers_one_repair_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "sample.py").write_text("print('ok')\n", encoding="utf-8")
+            fake_llm = FakeLlmClient(
+                [
+                    _task_plan_json(task_type="edit", requires_tests=True),
+                    _agent_tool_call("run_tests", {"command_name": "unit"}),
+                    _agent_tool_call("finish", {"answer": "首次完成"}),
+                    _agent_tool_call("run_tests", {"command_name": "unit"}),
+                    _agent_tool_call("finish", {"answer": "修复后完成"}),
+                ],
+                prepend_plan=False,
+            )
+            run_logger = RunLogger(repo_path=repo_path, user_task="repair", log_dir=repo_path / "logs")
+            run_tests_calls = 0
+
+            def fake_tool_runner(tool_call: dict[str, object]) -> object:
+                nonlocal run_tests_calls
+                tool_name = tool_call.get("tool")
+                if tool_name == "run_tests":
+                    run_tests_calls += 1
+                    return {
+                        "command_name": "unit",
+                        "exit_code": 1 if run_tests_calls == 1 else 0,
+                        "stdout": "",
+                        "stderr": "failed" if run_tests_calls == 1 else "",
+                        "timed_out": False,
+                    }
+                if tool_name == "finish":
+                    tool_args = cast(dict[str, object], tool_call["args"])
+                    return tool_args["answer"]
+                raise ToolError(f"unexpected tool: {tool_name}")
+
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=4,
+                tool_runner=fake_tool_runner,
+            )
+
+            final_answer = agent.answer("测试失败后修复")
+
+            _assert_v06_summary(self, final_answer, "修复后完成")
+            self.assertEqual(2, run_tests_calls)
+            self.assertEqual(1, run_logger.payload["repair_attempts"])
+            self.assertEqual(1, run_logger.payload["repair_attempt"])
+            self.assertEqual(
+                ["INIT", "PLAN", "EXECUTE", "VERIFY", "REPAIR", "EXECUTE", "VERIFY", "FINISH"],
+                run_logger.payload["stage_history"],
+            )
+            verify_status = cast(dict[str, object], run_logger.payload["verify_status"])
+            self.assertTrue(verify_status["passed"])
+
+    def test_analysis_plan_tests_failed_does_not_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            fake_llm = FakeLlmClient(
+                [
+                    _task_plan_json(task_type="analysis", requires_tests=True),
+                    _agent_tool_call("run_tests", {"command_name": "unit"}),
+                    _agent_tool_call("finish", {"answer": "首次完成"}),
+                    _agent_tool_call("run_tests", {"command_name": "unit"}),
+                    _agent_tool_call("finish", {"answer": "不应修复"}),
+                ],
+                prepend_plan=False,
+            )
+            run_logger = RunLogger(repo_path=repo_path, user_task="analysis no repair", log_dir=repo_path / "logs")
+            run_tests_calls = 0
+
+            def fake_tool_runner(tool_call: dict[str, object]) -> object:
+                nonlocal run_tests_calls
+                tool_name = tool_call.get("tool")
+                if tool_name == "run_tests":
+                    run_tests_calls += 1
+                    return {
+                        "command_name": "unit",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "failed",
+                        "timed_out": False,
+                    }
+                if tool_name == "finish":
+                    tool_args = cast(dict[str, object], tool_call["args"])
+                    return tool_args["answer"]
+                raise ToolError(f"unexpected tool: {tool_name}")
+
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=4,
+                tool_runner=fake_tool_runner,
+            )
+
+            final_answer = agent.answer("analysis 测试失败不修复")
+
+            _assert_v06_summary(self, final_answer, "首次完成")
+            self.assertEqual(1, run_tests_calls)
+            self.assertEqual(0, run_logger.payload["repair_attempts"])
+            self.assertEqual(["INIT", "PLAN", "EXECUTE", "VERIFY", "FINISH"], run_logger.payload["stage_history"])
+            self.assertIsNotNone(run_logger.payload["error"])
+            self.assertIn("tests_failed", str(run_logger.payload["verify_status"]))
 
     def test_logger_keeps_full_tool_results_after_compaction(self) -> None:
         large_observation = "raw-line\n" * 200
@@ -737,7 +1072,7 @@ class TestAgentContextV05(unittest.TestCase):
 
             final_answer = agent.answer("读取四个文件后完成")
 
-            self.assertEqual("完成", final_answer)
+            _assert_v06_summary(self, final_answer, "完成")
             compacted_llm_payload = "\n".join(
                 message["content"] for message in fake_llm.messages_by_call[-1]
             )
@@ -771,6 +1106,62 @@ class TestPromptContextV05(unittest.TestCase):
         self.assertIn("优先使用 read_file_range", self.prompt)
         self.assertIn("禁止完整读取与任务无关的大文件", self.prompt)
         self.assertIn("文件名、函数名、类名、行号和已读取证据", self.prompt)
+
+
+class TestRunLoggerV06Protocol(unittest.TestCase):
+    """验证 logger payload 的 v0.6 默认字段与旧字段兼容。"""
+
+    def test_payload_keeps_legacy_fields_and_adds_v06_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            run_logger = RunLogger(repo_path=repo_path, user_task="检查日志", log_dir=repo_path / "logs")
+
+            for legacy_field in [
+                "started_at",
+                "repo_path",
+                "user_task",
+                "steps",
+                "final_answer",
+                "error",
+                "context_stats",
+            ]:
+                with self.subTest(legacy_field=legacy_field):
+                    self.assertIn(legacy_field, run_logger.payload)
+
+            self.assertEqual("INIT", run_logger.payload["stage"])
+            self.assertEqual(["INIT"], run_logger.payload["stage_history"])
+            self.assertIsNone(run_logger.payload["plan"])
+            self.assertIsNone(run_logger.payload["plan_step_id"])
+            self.assertEqual(0, run_logger.payload["repair_attempt"])
+            self.assertEqual(0, run_logger.payload["repair_attempts"])
+            self.assertIsNone(run_logger.payload["verify_status"])
+
+    def test_record_step_keeps_old_shape_and_copies_plan_step_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            run_logger = RunLogger(repo_path=repo_path, user_task="检查步骤", log_dir=repo_path / "logs")
+            tool_call = {
+                "thought": "读取文件",
+                "plan_step_id": "step-1",
+                "tool": "read_file",
+                "args": {"path": "sample.py"},
+            }
+
+            run_logger.record_step(
+                step_number=1,
+                model_output=json.dumps(tool_call, ensure_ascii=False),
+                tool_call=tool_call,
+                tool_result={"ok": True, "output": "ok"},
+            )
+
+            steps = cast(list[dict[str, object]], run_logger.payload["steps"])
+            self.assertEqual(1, len(steps))
+            step_payload = steps[0]
+            for old_step_field in ["step", "model_output", "tool_call", "tool_result"]:
+                with self.subTest(old_step_field=old_step_field):
+                    self.assertIn(old_step_field, step_payload)
+            self.assertEqual("step-1", step_payload["plan_step_id"])
+            self.assertEqual("step-1", run_logger.payload["plan_step_id"])
 
 
 if __name__ == "__main__":

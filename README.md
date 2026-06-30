@@ -12,6 +12,7 @@
 - v0.3 修改流程会把补丁保存到 `.repopilot/patches`，应用前展示补丁并等待用户确认，应用时在 `.repopilot/backups` 创建备份，在 `.repopilot/runs` 写入事件日志。
 - v0.4 提供编辑评测入口，用临时 fixture 副本验证 agent 的受控修改能力。
 - v0.5 提供上下文统计、读取预算和项目索引工具，帮助 agent 先定位再按需读取文件。
+- v0.6 引入 `Plan → Execute → Verify` 运行协议，用确定性校验和最多一次 repair 管住编辑流程。
 
 ## 工具
 
@@ -50,6 +51,8 @@ python run_edit_eval.py
 
 `auto_for_eval` 只供评测 runner 在带 marker 校验的临时代码库内部使用，用来避免交互输入阻塞自动评测。普通 CLI 仍然要求用户手动批准 `apply_patch`，不要在日常使用中手动启用或创建 `auto_for_eval` 批准。
 
+当通过本仓库的 `run_edit_eval.py` 运行内置 `eval_cases/edit_cases.json` 或 `eval_cases/context_cases.json` 时，CLI 会使用仅限这些 bundled cases 的确定性 LLM fallback，避免外部 LLM/API 不可用导致评测超时。该 fallback 仍会驱动真实 `CodeAnalysisAgent`、安全工具、补丁提案、`auto_for_eval` 临时仓库应用、测试和日志校验；自定义 eval 文件不会自动启用该 fallback，仍走正常 LLM 配置。
+
 评测用例位于 `eval_cases/edit_cases.json`，每个 case 包含 `id`、`fixture`、`prompt`、`max_steps`、`allowed_changed_files`、`must_contain`，并可选 `test_command` 和 `expect_no_business_changes`。`test_command` 只支持 `unit` 和 `compile`，仍然沿用 no arbitrary shell 和 no framework 约束。
 
 ## v0.5 上下文管理与项目索引
@@ -73,6 +76,25 @@ python run_edit_eval.py --cases eval_cases/context_cases.json
 CLI 会记录结构化结果和上下文违规原因，例如 `must_not_read_full_files` 或 `max_total_tool_output_chars` 失败；真实 LLM 是否通过上下文用例取决于模型实际工具选择，不承诺每次都通过。
 
 项目保持纯 Python 安全工具调用实现：不使用 LangChain、LangGraph、LlamaIndex、MCP 或 vector DB，不提供 arbitrary shell，也不加入语义搜索、外部 agent 框架或联网协作。
+
+## v0.6 Plan → Execute → Verify
+
+v0.6 不是多 agent，也不引入外部编排框架；它仍然是单个本地 agent，在原有安全工具上增加更明确的阶段协议。
+
+- `PLAN`：planner 必须输出严格 `TaskPlan` JSON，不能包含 Markdown、代码块或额外说明。
+- `EXECUTE`：每次工具调用必须是严格 JSON，结构为 `{thought, plan_step_id, tool, args}`，其中 `plan_step_id` 必须来自计划步骤。
+- `VERIFY`：`finish` 后由确定性程序验证和白名单测试决定结果，模型不能用自我声明代替验证；最终答案需要汇总 plan steps、changed files、tests、verification 和 repair 情况。
+- repair 最多 1 次，只在验证发现可修复的测试失败时触发。
+
+常用验证命令：
+
+```powershell
+python -m unittest discover
+python run_edit_eval.py --cases eval_cases/edit_cases.json
+python run_edit_eval.py --cases eval_cases/context_cases.json
+```
+
+普通 CLI 的 `apply_patch` 仍然要求用户手动确认。`auto_for_eval` 只允许评测 runner 在带 marker 的临时 eval repo 中使用，不能用于真实项目或日常 CLI。
 
 ## 配置
 
@@ -120,11 +142,12 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 
 ## 模型输出协议
 
-模型每一步必须只输出一个 JSON 对象：
+模型每一步必须只输出一个 JSON 对象，`plan_step_id` 必须来自 `TaskPlan.steps`：
 
 ```json
 {
   "thought": "先查看项目根目录。",
+  "plan_step_id": "step-1",
   "tool": "list_dir",
   "args": {
     "path": "."
@@ -137,6 +160,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```json
 {
   "thought": "先读取待修改区域，确认上下文。",
+  "plan_step_id": "step-1",
   "tool": "read_file_range",
   "args": {
     "path": "prompts.py",
@@ -151,6 +175,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```json
 {
   "thought": "已经确认目标文本，保存补丁提案供用户审查。",
+  "plan_step_id": "step-1",
   "tool": "propose_patch",
   "args": {
     "instruction": "更新 prompts.py 的安全流程说明。",
@@ -164,6 +189,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```json
 {
   "thought": "用户已经在 CLI 中批准补丁，开始应用保存的补丁。",
+  "plan_step_id": "step-1",
   "tool": "apply_patch",
   "args": {
     "patch_id": "20260618_100000_abcd1234ef56"
@@ -176,6 +202,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```json
 {
   "thought": "补丁已经应用，运行单元测试验证。",
+  "plan_step_id": "step-1",
   "tool": "run_tests",
   "args": {
     "command_name": "unit"
@@ -188,6 +215,7 @@ python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
 ```json
 {
   "thought": "已经得到足够信息。",
+  "plan_step_id": "step-1",
   "tool": "finish",
   "args": {
     "answer": "最终答案，例如：入口逻辑在 main.py:25 的 main() 中。"

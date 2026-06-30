@@ -23,6 +23,13 @@ class RunLogger:
             "started_at": started_at.isoformat(),
             "repo_path": str(repo_path),
             "user_task": user_task,
+            "stage": "INIT",
+            "stage_history": ["INIT"],
+            "plan": None,
+            "plan_step_id": None,
+            "repair_attempt": 0,
+            "repair_attempts": 0,
+            "verify_status": None,
             "steps": [],
             "final_answer": None,
             "error": None,
@@ -43,14 +50,19 @@ class RunLogger:
         if not isinstance(steps, list):
             raise RuntimeError("日志结构错误: steps 不是列表")
 
-        steps.append(
-            {
-                "step": step_number,
-                "model_output": model_output,
-                "tool_call": tool_call,
-                "tool_result": tool_result,
-            }
-        )
+        step_payload: dict[str, object] = {
+            "step": step_number,
+            "model_output": model_output,
+            "tool_call": tool_call,
+            "tool_result": tool_result,
+        }
+        if isinstance(tool_call, dict):
+            plan_step_id = tool_call.get("plan_step_id")
+            if plan_step_id is not None:
+                step_payload["plan_step_id"] = plan_step_id
+                self.payload["plan_step_id"] = plan_step_id
+
+        steps.append(step_payload)
         self.save()
 
     def set_final_answer(self, final_answer: str) -> None:

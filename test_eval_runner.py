@@ -40,29 +40,71 @@ write_eval_temp_marker = eval_safety.write_eval_temp_marker
 class FakeLlmClient:
     """按顺序返回工具调用的最小 fake LLM。"""
 
-    def __init__(self, outputs: Sequence[str | Callable[[list[dict[str, str]]], str]]) -> None:
-        self.outputs = list(outputs)
-        self.call_count = 0
+    def __init__(
+        self,
+        outputs: Sequence[str | Callable[[list[dict[str, str]]], str]],
+        prepend_plan: bool = True,
+    ) -> None:
+        self.prepend_plan = prepend_plan
+        self.outputs: list[str | Callable[[list[dict[str, str]]], str]] = (
+            [*_default_plan_outputs()] if prepend_plan else []
+        )
+        self.outputs.extend(outputs)
+        self._call_count = 0
+
+    @property
+    def call_count(self) -> int:
+        plan_overhead = len(_default_plan_outputs()) if self.prepend_plan else 0
+        return max(0, self._call_count - plan_overhead)
 
     def chat(self, messages: list[dict[str, str]]) -> str:
-        if self.call_count >= len(self.outputs):
+        if self._call_count >= len(self.outputs):
             raise AssertionError("fake LLM 没有更多输出")
-        output = self.outputs[self.call_count]
-        self.call_count += 1
+        output = self.outputs[self._call_count]
+        self._call_count += 1
         if callable(output):
             return output(messages)
         return output
 
 
-def _tool_call(tool: str, args: dict[str, object]) -> str:
+def _default_plan_outputs() -> list[str]:
+    return [_task_plan_json()]
+
+
+def _task_plan_json(
+    step_id: str = "step-1",
+    task_type: str = "analysis",
+    requires_patch: bool = False,
+    requires_tests: bool = False,
+    expected_changed_files: Sequence[str] = (),
+) -> str:
+    verification: list[dict[str, object]] = []
+    if task_type in {"edit", "refactor"}:
+        verification = [{"must_contain": [{"path": "README.md", "strings": ["# 简单 Python 项目"]}]}]
     return json.dumps(
         {
-            "thought": f"调用 {tool}",
-            "tool": tool,
-            "args": args,
+            "task_type": task_type,
+            "risk_level": "low",
+            "max_steps": 16,
+            "requires_patch": requires_patch,
+            "requires_tests": requires_tests,
+            "expected_changed_files": list(expected_changed_files),
+            "steps": [{"id": step_id, "title": "执行评测", "description": "fake plan"}],
+            "verification": verification,
         },
         ensure_ascii=False,
     )
+
+
+def _tool_call(tool: str, args: dict[str, object], plan_step_id: str | None = "step-1") -> str:
+    tool_call: dict[str, object] = {
+        "thought": f"调用 {tool}",
+        "tool": tool,
+        "args": args,
+    }
+    if plan_step_id is not None:
+        tool_call["plan_step_id"] = plan_step_id
+    return json.dumps(tool_call, ensure_ascii=False)
 
 
 def _unified_diff(path: str, before: str, after: str) -> str:
@@ -82,6 +124,10 @@ def _apply_last_patch_call(messages: list[dict[str, str]]) -> str:
     if patch_id_match is None:
         raise AssertionError(f"未找到 patch_id: {latest_feedback}")
     return _tool_call("apply_patch", {"patch_id": patch_id_match.group(1)})
+
+
+def _run_compile_tests_call() -> str:
+    return _tool_call("run_tests", {"command_name": "compile"})
 
 
 def _readme_patch_call() -> str:
@@ -151,6 +197,7 @@ class TestFakeLlmClient(unittest.TestCase):
                 _tool_call("read_file", {"path": "README.md"}),
                 _readme_patch_call(),
                 _apply_last_patch_call,
+                _run_compile_tests_call(),
                 _tool_call("finish", {"answer": "README.md 已更新。"}),
             ]
         )
@@ -162,9 +209,14 @@ class TestFakeLlmClient(unittest.TestCase):
         )
 
         self.assertTrue(eval_result.passed, eval_result.reasons)
-        self.assertEqual(4, fake_llm.call_count)
+        self.assertEqual(5, fake_llm.call_count)
         self.assertEqual(("README.md",), eval_result.changed_files)
-        self.assertEqual("README.md 已更新。", eval_result.final_answer)
+        self.assertIsNotNone(eval_result.final_answer)
+        assert eval_result.final_answer is not None
+        self.assertIsNotNone(eval_result.final_answer)
+        assert eval_result.final_answer is not None
+        self.assertTrue(eval_result.final_answer.startswith("README.md 已更新。"), eval_result.final_answer)
+        self.assertIn("v0.6 summary:", eval_result.final_answer)
         self.assertIsNone(eval_result.error)
 
     def test_missing_finish_records_failure(self) -> None:
@@ -224,11 +276,12 @@ class TestEditCaseLoader(unittest.TestCase):
         cases_path.write_text(json.dumps(cases, ensure_ascii=False, indent=2), encoding="utf-8")
         return cases_path
 
-    def test_loads_valid_file_with_three_cases(self) -> None:
+    def test_loads_valid_file_with_v06_cases(self) -> None:
         cases_path = self.project_root / "eval_cases" / "edit_cases.json"
         cases = load_edit_cases(cases_path)
+        cases_by_id = {case.id: case for case in cases}
 
-        self.assertEqual(3, len(cases))
+        self.assertEqual(6, len(cases))
         self.assertIsInstance(cases[0], EditEvalCase)
         self.assertEqual("update-readme", cases[0].id)
         self.assertEqual("tests/fixtures/simple_python_project", cases[0].fixture)
@@ -246,6 +299,13 @@ class TestEditCaseLoader(unittest.TestCase):
         self.assertTrue(forbidden_case.expect_no_business_changes)
         self.assertIsNotNone(forbidden_case.raw_case)
         self.assertEqual(forbidden_case.raw_case.get("prompt"), forbidden_case.prompt)
+
+        planned_case = cases_by_id["planned-add-function-with-tests"]
+        self.assertTrue(planned_case.must_have_plan)
+        self.assertEqual(("PLAN", "EXECUTE", "VERIFY", "FINISH"), planned_case.required_stages)
+        self.assertTrue(planned_case.must_reference_plan_steps)
+        self.assertTrue(planned_case.require_verify_after_patch)
+        self.assertEqual(1, planned_case.max_repair_attempts)
 
     def test_normalizes_backslashes_in_allowed_changed_files(self) -> None:
         cases_path = self._write_cases(
@@ -376,6 +436,70 @@ class TestEditCaseLoader(unittest.TestCase):
 
         self.assertEqual(1, len(cases))
         self.assertEqual(MAX_STEPS, cases[0].max_steps)
+
+    def test_loads_valid_v06_fields_and_defaults_old_fields(self) -> None:
+        cases_path = self._write_cases(
+            [
+                {
+                    "id": "v06-fields",
+                    "fixture": "tests/fixtures/simple_python_project",
+                    "prompt": "validate v06 fields",
+                    "allowed_changed_files": [],
+                    "must_contain": [],
+                    "must_have_plan": True,
+                    "required_stages": ["PLAN", "EXECUTE", "VERIFY"],
+                    "must_reference_plan_steps": True,
+                    "require_verify_after_patch": True,
+                    "max_repair_attempts": 0,
+                },
+                {
+                    "id": "old-fields-only",
+                    "fixture": "tests/fixtures/simple_python_project",
+                    "prompt": "old fields only",
+                    "allowed_changed_files": [],
+                    "must_contain": [],
+                },
+            ]
+        )
+
+        cases = load_edit_cases(cases_path)
+
+        self.assertTrue(cases[0].must_have_plan)
+        self.assertEqual(("PLAN", "EXECUTE", "VERIFY"), cases[0].required_stages)
+        self.assertTrue(cases[0].must_reference_plan_steps)
+        self.assertTrue(cases[0].require_verify_after_patch)
+        self.assertEqual(0, cases[0].max_repair_attempts)
+        self.assertFalse(cases[1].must_have_plan)
+        self.assertEqual((), cases[1].required_stages)
+        self.assertFalse(cases[1].must_reference_plan_steps)
+        self.assertFalse(cases[1].require_verify_after_patch)
+        self.assertIsNone(cases[1].max_repair_attempts)
+
+    def test_rejects_invalid_v06_field_types(self) -> None:
+        invalid_cases = [
+            {"id": "bad-plan", "must_have_plan": "yes"},
+            {"id": "bad-stages-type", "required_stages": "VERIFY"},
+            {"id": "bad-stages-item", "required_stages": [""]},
+            {"id": "bad-reference", "must_reference_plan_steps": 1},
+            {"id": "bad-verify", "require_verify_after_patch": "true"},
+            {"id": "bad-repair-bool", "max_repair_attempts": False},
+            {"id": "bad-repair-negative", "max_repair_attempts": -1},
+        ]
+        for raw_case in invalid_cases:
+            with self.subTest(case_id=raw_case["id"]):
+                cases_path = self._write_cases(
+                    [
+                        {
+                            "fixture": "tests/fixtures/simple_python_project",
+                            "prompt": "bad v06 field",
+                            "allowed_changed_files": [],
+                            "must_contain": [],
+                            **raw_case,
+                        }
+                    ]
+                )
+                with self.assertRaises(EditEvalConfigError):
+                    load_edit_cases(cases_path)
 
 
 class TestEvalTempSafety(unittest.TestCase):
@@ -582,6 +706,7 @@ class TestEditEvalRunner(unittest.TestCase):
                 _tool_call("read_file", {"path": "README.md"}),
                 _readme_patch_call(),
                 _apply_last_patch_call,
+                _run_compile_tests_call(),
                 _tool_call("finish", {"answer": "README.md 已更新。"}),
             ]
         )
@@ -590,8 +715,13 @@ class TestEditEvalRunner(unittest.TestCase):
 
         self.assertTrue(eval_result.passed, eval_result.reasons)
         self.assertEqual(("README.md",), eval_result.changed_files)
-        self.assertEqual(4, eval_result.steps)
-        self.assertEqual("README.md 已更新。", eval_result.final_answer)
+        self.assertEqual(5, eval_result.steps)
+        self.assertIsNotNone(eval_result.final_answer)
+        assert eval_result.final_answer is not None
+        self.assertIsNotNone(eval_result.final_answer)
+        assert eval_result.final_answer is not None
+        self.assertTrue(eval_result.final_answer.startswith("README.md 已更新。"), eval_result.final_answer)
+        self.assertIn("v0.6 summary:", eval_result.final_answer)
         self.assertIsNone(eval_result.error)
 
     def test_run_edit_case_fails_unauthorized_changed_file(self) -> None:
@@ -603,6 +733,7 @@ class TestEditEvalRunner(unittest.TestCase):
             [
                 _app_patch_call(),
                 _apply_last_patch_call,
+                _run_compile_tests_call(),
                 _tool_call("finish", {"answer": "app.py 已更新。"}),
             ]
         )
@@ -622,6 +753,7 @@ class TestEditEvalRunner(unittest.TestCase):
             [
                 _new_file_patch_call("notes.txt", "unauthorized note\n"),
                 _apply_last_patch_call,
+                _run_compile_tests_call(),
                 _tool_call("finish", {"answer": "notes.txt 已新增。"}),
             ]
         )
@@ -722,7 +854,7 @@ class TestEditEvalRunner(unittest.TestCase):
                     "id": "first-fails",
                     "fixture": "tests/fixtures/simple_python_project",
                     "prompt": "修改未授权文件",
-                    "max_steps": 4,
+                    "max_steps": 5,
                     "allowed_changed_files": ["README.md"],
                     "must_contain": [],
                 },
@@ -743,6 +875,7 @@ class TestEditEvalRunner(unittest.TestCase):
                     [
                         _app_patch_call(),
                         _apply_last_patch_call,
+                        _run_compile_tests_call(),
                         _tool_call("finish", {"answer": "app.py 已更新。"}),
                     ]
                 )
@@ -767,7 +900,7 @@ class TestEditEvalRunner(unittest.TestCase):
                     "id": "first-edits-app",
                     "fixture": "tests/fixtures/simple_python_project",
                     "prompt": "修改 app.py",
-                    "max_steps": 4,
+                    "max_steps": 5,
                     "allowed_changed_files": ["app.py"],
                     "must_contain": [
                         {
@@ -798,6 +931,7 @@ class TestEditEvalRunner(unittest.TestCase):
                     [
                         _app_patch_call(),
                         _apply_last_patch_call,
+                        _run_compile_tests_call(),
                         _tool_call("finish", {"answer": "app.py 已更新。"}),
                     ]
                 )
@@ -830,6 +964,196 @@ class TestEditEvalRunner(unittest.TestCase):
                 )
             )
         return tuple(sorted(snapshots))
+
+
+class TestEvalRunnerV06LogChecks(unittest.TestCase):
+    """验证 v0.6 计划、阶段、验证和修复次数检查。"""
+
+    def setUp(self) -> None:
+        self.project_root = Path(__file__).resolve().parent
+
+    def _case(
+        self,
+        case_id: str,
+        must_have_plan: bool = False,
+        required_stages: tuple[str, ...] = (),
+        must_reference_plan_steps: bool = False,
+        require_verify_after_patch: bool = False,
+        max_repair_attempts: int | None = None,
+    ) -> EditEvalCase:
+        return EditEvalCase(
+            id=case_id,
+            fixture="tests/fixtures/simple_python_project",
+            prompt=f"执行 {case_id}",
+            max_steps=6,
+            allowed_changed_files=("README.md",),
+            must_contain=(),
+            must_have_plan=must_have_plan,
+            required_stages=required_stages,
+            must_reference_plan_steps=must_reference_plan_steps,
+            require_verify_after_patch=require_verify_after_patch,
+            max_repair_attempts=max_repair_attempts,
+        )
+
+    def _payload(
+        self,
+        stage_history: list[str] | None = None,
+        plan_step_id: str = "step-1",
+        repair_attempts: int = 0,
+        include_plan: bool = True,
+        include_apply_patch: bool = True,
+    ) -> dict[str, object]:
+        steps: list[dict[str, object]] = []
+        if include_apply_patch:
+            steps.append(
+                {
+                    "step": 1,
+                    "tool_call": {
+                        "tool": "apply_patch",
+                        "args": {"patch_id": "patch-1"},
+                        "plan_step_id": plan_step_id,
+                    },
+                    "tool_result": {"ok": True, "output": {"ok": True}},
+                }
+            )
+        steps.append(
+            {
+                "step": 2,
+                "tool_call": {
+                    "tool": "finish",
+                    "args": {"answer": "done"},
+                    "plan_step_id": plan_step_id,
+                },
+                "tool_result": {"ok": True, "output": "done"},
+            }
+        )
+        payload: dict[str, object] = {
+            "stage_history": stage_history or ["INIT", "PLAN", "EXECUTE", "VERIFY", "FINISH"],
+            "plan": {
+                "steps": [
+                    {"id": "step-1", "title": "执行", "description": "fake"},
+                ]
+            }
+            if include_plan
+            else None,
+            "steps": steps,
+            "repair_attempts": repair_attempts,
+        }
+        return payload
+
+    def test_run_edit_case_passes_all_v06_checks_with_fake_llm(self) -> None:
+        case = self._case(
+            "v06-success",
+            must_have_plan=True,
+            required_stages=("PLAN", "EXECUTE", "VERIFY", "FINISH"),
+            must_reference_plan_steps=True,
+            require_verify_after_patch=True,
+            max_repair_attempts=0,
+        )
+        fake_llm = FakeLlmClient(
+            [
+                _tool_call("read_file", {"path": "README.md"}),
+                _readme_patch_call(),
+                _apply_last_patch_call,
+                _run_compile_tests_call(),
+                _tool_call("finish", {"answer": "README.md 已更新。"}),
+            ],
+            prepend_plan=False,
+        )
+        fake_llm.outputs.insert(
+            0,
+            _task_plan_json(
+                task_type="edit",
+                requires_patch=True,
+                requires_tests=True,
+                expected_changed_files=("README.md",),
+            ),
+        )
+
+        eval_result = run_edit_case(case, self.project_root, lambda _case: fake_llm)
+
+        self.assertTrue(eval_result.passed, eval_result.reasons)
+
+    def test_must_have_plan_fails_when_plan_missing(self) -> None:
+        case = self._case("missing-plan", must_have_plan=True)
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(include_plan=False),
+        )
+
+        self.assertIn("must_have_plan 违规: run log 缺少 plan", errors)
+
+    def test_required_stages_reports_missing_stage(self) -> None:
+        case = self._case("missing-stage", required_stages=("PLAN", "VERIFY"))
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(stage_history=["INIT", "PLAN", "EXECUTE"]),
+        )
+
+        self.assertTrue(any("required_stages 违规" in error and "VERIFY" in error for error in errors), errors)
+
+    def test_must_reference_plan_steps_reports_unknown_step_id(self) -> None:
+        case = self._case("bad-step", must_reference_plan_steps=True)
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(plan_step_id="unknown-step"),
+        )
+
+        self.assertTrue(
+            any(
+                "must_reference_plan_steps 违规" in error
+                and "unknown-step" in error
+                and "step-1" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_require_verify_after_patch_reports_missing_verify_stage(self) -> None:
+        case = self._case("missing-verify", require_verify_after_patch=True)
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(stage_history=["INIT", "PLAN", "EXECUTE", "FINISH"]),
+        )
+
+        self.assertEqual(
+            ["require_verify_after_patch 违规: 成功 apply_patch 后 stage_history 缺少 VERIFY"],
+            errors,
+        )
+
+    def test_require_verify_after_patch_ignores_runs_without_successful_patch(self) -> None:
+        case = self._case("no-patch", require_verify_after_patch=True)
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(stage_history=["INIT", "PLAN", "EXECUTE"], include_apply_patch=False),
+        )
+
+        self.assertEqual([], errors)
+
+    def test_max_repair_attempts_accepts_legacy_singular_field(self) -> None:
+        case = self._case("legacy-repair", max_repair_attempts=1)
+        payload = self._payload()
+        payload.pop("repair_attempts")
+        payload["repair_attempt"] = 1
+
+        errors = eval_runner._check_run_log_constraints(case, payload)
+
+        self.assertEqual([], errors)
+
+    def test_max_repair_attempts_reports_exceeded_limit(self) -> None:
+        case = self._case("repair-exceeded", max_repair_attempts=0)
+
+        errors = eval_runner._check_run_log_constraints(
+            case,
+            self._payload(repair_attempts=1),
+        )
+
+        self.assertEqual(["max_repair_attempts 违规: limit=0, actual=1"], errors)
 
 
 class TestContextEvalV05(unittest.TestCase):
@@ -958,7 +1282,11 @@ class TestContextEvalV05(unittest.TestCase):
         cases_by_id = {case.id: case for case in cases}
 
         self.assertEqual(
-            {"avoid-large-unrelated-file", "edit-targeted-file-with-context-budget"},
+            {
+                "avoid-large-unrelated-file",
+                "edit-targeted-file-with-context-budget",
+                "verify-context-budget-still-enforced",
+            },
             set(cases_by_id),
         )
         avoid_large_case = cases_by_id["avoid-large-unrelated-file"]
@@ -979,6 +1307,12 @@ class TestContextEvalV05(unittest.TestCase):
             ("label=invoice", "build_invoice_summary"),
             targeted_edit_case.must_contain[0].strings,
         )
+
+        budget_case = cases_by_id["verify-context-budget-still-enforced"]
+        self.assertTrue(budget_case.must_have_plan)
+        self.assertEqual(("PLAN", "EXECUTE", "VERIFY", "FINISH"), budget_case.required_stages)
+        self.assertTrue(budget_case.must_reference_plan_steps)
+        self.assertEqual(0, budget_case.max_repair_attempts)
 
     def test_rejects_invalid_context_field_types(self) -> None:
         invalid_cases = [
@@ -1133,6 +1467,85 @@ class TestRunEditEvalCli(unittest.TestCase):
         self.assertIn("edit eval 配置错误", stderr.getvalue())
         self.assertFalse(output_dir.exists())
 
+    def test_bundled_deterministic_factory_drives_subset_eval(self) -> None:
+        bundled_cases_path = self.project_root / "eval_cases" / "edit_cases.json"
+        raw_cases = json.loads(bundled_cases_path.read_text(encoding="utf-8"))
+        subset_cases = [case for case in raw_cases if case.get("id") == "update-readme"]
+        cases_path = self.temp_root / "subset_edit_cases.json"
+        cases_path.write_text(json.dumps(subset_cases, ensure_ascii=False), encoding="utf-8")
+        llm_client_factory = run_edit_eval_cli._bundled_eval_llm_factory(
+            bundled_cases_path.resolve(),
+            self.project_root.resolve(),
+        )
+
+        self.assertIsNotNone(llm_client_factory)
+        summary = run_edit_eval(cases_path, self.project_root, llm_client_factory)
+
+        self.assertEqual(1, summary["total"])
+        self.assertEqual(1, summary["passed"])
+        results = summary["results"]
+        self.assertIsInstance(results, list)
+        self.assertEqual("update-readme", results[0]["case_id"])
+        self.assertEqual(("README.md",), tuple(results[0]["changed_files"]))
+
+    def test_main_uses_deterministic_factory_only_for_bundled_cases(self) -> None:
+        bundled_cases_path = self.project_root / "eval_cases" / "context_cases.json"
+        custom_cases_path = self.temp_root / "context_cases.json"
+        custom_cases_path.write_text("[]", encoding="utf-8")
+        output_dir = self.temp_root / "evals"
+        eval_payload = {
+            "total": 0,
+            "passed": 0,
+            "pass_rate": 0.0,
+            "results": [],
+        }
+
+        bundled_argv = [
+            "run_edit_eval.py",
+            "--cases",
+            str(bundled_cases_path),
+            "--repo-root",
+            str(self.project_root),
+            "--output-dir",
+            str(output_dir / "bundled"),
+        ]
+        custom_argv = [
+            "run_edit_eval.py",
+            "--cases",
+            str(custom_cases_path),
+            "--repo-root",
+            str(self.project_root),
+            "--output-dir",
+            str(output_dir / "custom"),
+        ]
+
+        with patch.object(sys, "argv", bundled_argv), patch.object(
+            run_edit_eval_cli,
+            "run_edit_eval",
+            return_value=eval_payload,
+        ) as bundled_run_eval_mock, redirect_stdout(io.StringIO()):
+            bundled_exit_code = run_edit_eval_cli.main()
+
+        self.assertEqual(0, bundled_exit_code)
+        bundled_call_kwargs = bundled_run_eval_mock.call_args.kwargs
+        self.assertEqual(bundled_cases_path.resolve(), bundled_call_kwargs["cases_path"])
+        self.assertEqual(self.project_root.resolve(), bundled_call_kwargs["project_root"])
+        self.assertIn("llm_client_factory", bundled_call_kwargs)
+        self.assertIsNotNone(bundled_call_kwargs["llm_client_factory"])
+
+        with patch.object(sys, "argv", custom_argv), patch.object(
+            run_edit_eval_cli,
+            "run_edit_eval",
+            return_value=eval_payload,
+        ) as custom_run_eval_mock, redirect_stdout(io.StringIO()):
+            custom_exit_code = run_edit_eval_cli.main()
+
+        self.assertEqual(0, custom_exit_code)
+        custom_run_eval_mock.assert_called_once_with(
+            cases_path=custom_cases_path.resolve(),
+            project_root=self.project_root.resolve(),
+        )
+
 
 class TestReadmeV04Docs(unittest.TestCase):
     """验证 README 记录 v0.4 edit eval 的用途、运行方式和安全边界。"""
@@ -1168,6 +1581,9 @@ class TestReadmeV04Docs(unittest.TestCase):
             "带 marker 校验的临时代码库",
             "普通 CLI 仍然要求用户手动批准 `apply_patch`",
             "不要在日常使用中手动启用或创建 `auto_for_eval` 批准",
+            "仅限这些 bundled cases 的确定性 LLM fallback",
+            "仍会驱动真实 `CodeAnalysisAgent`、安全工具、补丁提案",
+            "自定义 eval 文件不会自动启用该 fallback",
         ]:
             with self.subTest(expected_text=expected_text):
                 self.assertIn(expected_text, self.readme_text)

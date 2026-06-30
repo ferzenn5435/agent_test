@@ -1560,7 +1560,7 @@ class RepositoryTools:
             file_size = file_path.stat().st_size
         except OSError:
             return True
-        if file_size > MAX_FILE_BYTES:
+        if file_size > MAX_FILE_BYTES and file_path.suffix.lower() != ".py":
             return True
         return self._is_binary_file(file_path)
 

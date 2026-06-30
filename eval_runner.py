@@ -50,6 +50,11 @@ class EditEvalCase:
     expect_no_business_changes: bool = False
     must_not_read_full_files: tuple[str, ...] = ()
     max_total_tool_output_chars: int | None = None
+    must_have_plan: bool = False
+    required_stages: tuple[str, ...] = ()
+    must_reference_plan_steps: bool = False
+    require_verify_after_patch: bool = False
+    max_repair_attempts: int | None = None
     raw_case: dict[str, object] | None = None
 
 
@@ -269,6 +274,31 @@ def load_edit_cases(cases_path: Path) -> list[EditEvalCase]:
             case_index,
             "max_total_tool_output_chars",
         )
+        must_have_plan = _normalize_optional_bool(
+            raw_case.get("must_have_plan"),
+            case_index,
+            "must_have_plan",
+        )
+        required_stages = _normalize_optional_non_empty_strings(
+            raw_case.get("required_stages"),
+            case_index,
+            "required_stages",
+        )
+        must_reference_plan_steps = _normalize_optional_bool(
+            raw_case.get("must_reference_plan_steps"),
+            case_index,
+            "must_reference_plan_steps",
+        )
+        require_verify_after_patch = _normalize_optional_bool(
+            raw_case.get("require_verify_after_patch"),
+            case_index,
+            "require_verify_after_patch",
+        )
+        max_repair_attempts = _normalize_optional_non_negative_int(
+            raw_case.get("max_repair_attempts"),
+            case_index,
+            "max_repair_attempts",
+        )
         test_command = raw_case.get("test_command")
 
         if test_command is not None:
@@ -301,6 +331,11 @@ def load_edit_cases(cases_path: Path) -> list[EditEvalCase]:
                 expect_no_business_changes=expect_no_business_changes,
                 must_not_read_full_files=must_not_read_full_files,
                 max_total_tool_output_chars=max_total_tool_output_chars,
+                must_have_plan=must_have_plan,
+                required_stages=required_stages,
+                must_reference_plan_steps=must_reference_plan_steps,
+                require_verify_after_patch=require_verify_after_patch,
+                max_repair_attempts=max_repair_attempts,
                 raw_case=dict(raw_case),
             )
         )
@@ -378,6 +413,7 @@ def run_edit_case(
             error_message = _optional_string(run_logger.payload.get("error"))
             context_stats = _optional_context_stats(run_logger.payload.get("context_stats"))
             reasons.extend(_check_context_constraints(case, context_stats))
+            reasons.extend(_check_run_log_constraints(case, run_logger.payload))
 
             if case_exception is not None:
                 error_message = str(case_exception)
@@ -567,6 +603,144 @@ def _check_context_constraints(
     return errors
 
 
+def _check_run_log_constraints(
+    case: EditEvalCase,
+    payload: Mapping[str, object],
+) -> list[str]:
+    errors: list[str] = []
+    plan = payload.get("plan")
+    stage_history = _normalize_stage_history(payload.get("stage_history"))
+
+    if case.must_have_plan and not isinstance(plan, dict):
+        errors.append("must_have_plan 违规: run log 缺少 plan")
+
+    for required_stage in case.required_stages:
+        if required_stage not in stage_history:
+            errors.append(
+                "required_stages 违规: "
+                f"missing={required_stage}, actual_stage_history={stage_history}"
+            )
+
+    if case.must_reference_plan_steps:
+        errors.extend(_check_tool_calls_reference_plan_steps(payload, plan))
+
+    if case.require_verify_after_patch:
+        errors.extend(_check_verify_after_patch(payload, stage_history))
+
+    if case.max_repair_attempts is not None:
+        errors.extend(_check_repair_attempt_limit(payload, case.max_repair_attempts))
+
+    return errors
+
+
+def _normalize_stage_history(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(stage for stage in value if isinstance(stage, str))
+
+
+def _check_tool_calls_reference_plan_steps(
+    payload: Mapping[str, object],
+    plan: object,
+) -> list[str]:
+    valid_plan_step_ids = _plan_step_ids(plan)
+    if not valid_plan_step_ids:
+        return ["must_reference_plan_steps 违规: plan.steps 缺少有效 step id"]
+
+    errors: list[str] = []
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        return ["must_reference_plan_steps 违规: run log steps 不是数组"]
+
+    for step_index, raw_step in enumerate(steps, start=1):
+        if not isinstance(raw_step, dict):
+            continue
+        tool_call = raw_step.get("tool_call")
+        if not isinstance(tool_call, dict):
+            continue
+        plan_step_id = tool_call.get("plan_step_id")
+        if not isinstance(plan_step_id, str) or plan_step_id.strip() not in valid_plan_step_ids:
+            errors.append(
+                "must_reference_plan_steps 违规: "
+                f"step={step_index}, tool={tool_call.get('tool')}, "
+                f"plan_step_id={plan_step_id!r}, "
+                f"valid_plan_step_ids={tuple(sorted(valid_plan_step_ids))}"
+            )
+    return errors
+
+
+def _plan_step_ids(plan: object) -> set[str]:
+    if not isinstance(plan, dict):
+        return set()
+    raw_steps = plan.get("steps")
+    if not isinstance(raw_steps, list):
+        return set()
+
+    step_ids: set[str] = set()
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, dict):
+            continue
+        step_id = raw_step.get("id")
+        if isinstance(step_id, str) and step_id.strip():
+            step_ids.add(step_id.strip())
+    return step_ids
+
+
+def _check_verify_after_patch(
+    payload: Mapping[str, object],
+    stage_history: tuple[str, ...],
+) -> list[str]:
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+
+    has_successful_apply_patch = any(
+        _is_successful_apply_patch_step(raw_step)
+        for raw_step in steps
+        if isinstance(raw_step, dict)
+    )
+    if not has_successful_apply_patch:
+        return []
+    if "VERIFY" in stage_history:
+        return []
+
+    # 当前日志只记录全局 stage_history，不记录每个 step 的 stage 时间点；因此这里检查
+    # “成功 apply_patch 后本次运行进入过 VERIFY”，无法证明更细粒度的先后顺序。
+    return [
+        "require_verify_after_patch 违规: 成功 apply_patch 后 stage_history 缺少 VERIFY"
+    ]
+
+
+def _is_successful_apply_patch_step(raw_step: Mapping[str, object]) -> bool:
+    tool_call = raw_step.get("tool_call")
+    tool_result = raw_step.get("tool_result")
+    if not isinstance(tool_call, dict) or not isinstance(tool_result, dict):
+        return False
+    if tool_call.get("tool") != "apply_patch" or tool_result.get("ok") is not True:
+        return False
+    tool_output = tool_result.get("output")
+    if isinstance(tool_output, dict):
+        return tool_output.get("ok") is not False
+    return True
+
+
+def _check_repair_attempt_limit(
+    payload: Mapping[str, object],
+    max_repair_attempts: int,
+) -> list[str]:
+    raw_repair_attempts = payload.get("repair_attempts")
+    if raw_repair_attempts is None:
+        raw_repair_attempts = payload.get("repair_attempt")
+    if not isinstance(raw_repair_attempts, int) or isinstance(raw_repair_attempts, bool):
+        return ["max_repair_attempts 违规: run log 缺少整数 repair_attempts"]
+    if raw_repair_attempts > max_repair_attempts:
+        return [
+            "max_repair_attempts 违规: "
+            f"limit={max_repair_attempts}, actual={raw_repair_attempts}"
+        ]
+    return []
+
+
 def _normalize_context_path_list(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
@@ -728,6 +902,60 @@ def _normalize_optional_positive_int(
             f"第 {case_index} 条用例 {field_name} 必须是正整数或 null"
         )
     return raw_value
+
+
+def _normalize_optional_non_negative_int(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> int | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, int) or isinstance(raw_value, bool):
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是非负整数或 null"
+        )
+    if raw_value < 0:
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是非负整数或 null"
+        )
+    return raw_value
+
+
+def _normalize_optional_bool(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> bool:
+    if raw_value is None:
+        return False
+    if not isinstance(raw_value, bool):
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是 bool"
+        )
+    return raw_value
+
+
+def _normalize_optional_non_empty_strings(
+    raw_value: object | None,
+    case_index: int,
+    field_name: str,
+) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, (list, tuple)):
+        raise EditEvalConfigError(
+            f"第 {case_index} 条用例 {field_name} 必须是非空字符串数组"
+        )
+
+    normalized_values: list[str] = []
+    for raw_item in raw_value:
+        if not isinstance(raw_item, str) or not raw_item.strip():
+            raise EditEvalConfigError(
+                f"第 {case_index} 条用例 {field_name} 每项必须是非空字符串"
+            )
+        normalized_values.append(raw_item.strip())
+    return tuple(normalized_values)
 
 
 def _is_windows_absolute_path(value: str) -> bool:
