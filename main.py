@@ -1,4 +1,17 @@
-"""命令行入口。"""
+"""命令行入口与运行编排。
+
+本文件只负责以下三件事：
+
+1. 解析用户输入参数，支持 answer 主流程与 patch 子命令两条互斥路径。
+2. 在 answer 流程中组装 `RepositoryTools + LlmClient + CliApplyPatchApproval +
+   CodeAnalysisAgent`，形成一次完整的运行链路。
+3. 将 apply_patch 的执行动作固定在 CLI 的人工审批边界内，避免在主流程中
+   无条件应用文件变更。
+
+关键边界：
+- `main.py patch ...` 完全不进入 LLM/Config/Logger 的初始化，保持确定性路径；
+- answer 流程对异常做统一兜底，只写入日志并返回非零码，避免进程崩溃。
+"""
 
 from __future__ import annotations
 
@@ -20,7 +33,11 @@ APPROVAL_TOKENS = {"yes", "y", "approve"}
 
 
 def _positive_int(raw_value: str) -> int:
-    """解析正整数命令行参数。"""
+    """解析正整数命令行参数。
+
+用于 `--max-steps` 的严格类型校验；如果用户输入非整数或非正值，返回
+`argparse.ArgumentTypeError` 让 CLI 直接打印帮助与错误信息。
+    """
 
     try:
         parsed_value = int(raw_value)
@@ -36,7 +53,18 @@ def _positive_int(raw_value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """解析命令行参数。"""
+    """解析 answer 主流程参数。
+
+解析策略保持向后兼容：既支持 `python main.py <repo> <question>` 的位置参数，
+也支持 `--repo` 显式参数。
+
+返回值统一归一化为一个 `Namespace`，下游只读取:
+- command
+- repo_path
+- question
+- max_steps
+- model_profile
+    """
 
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "patch":
@@ -49,6 +77,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=MAX_STEPS,
         help=f"最大工具调用步数 (默认: {MAX_STEPS})",
+    )
+    parser.add_argument(
+        "--model-profile",
+        default="default",
+        help="模型 profile 名称 (默认: default)",
     )
     parser.add_argument("arguments", nargs="*", help="位置参数：repo 路径和用户问题")
     args = parser.parse_args(argv)
@@ -75,11 +108,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         repo_path=repo_path,
         question=" ".join(question_parts),
         max_steps=args.max_steps,
+        model_profile=args.model_profile,
     )
 
 
 def _parse_patch_args(argv: list[str]) -> argparse.Namespace:
-    """解析确定性 patch 子命令参数。"""
+    """解析确定性 patch 子命令参数。
+
+此分支用于 `python main.py patch <list|show|apply|reject>`，其目标是让
+patch 生命周期完全与 answer 主流程隔离：不读取 `.env`、不加载 profile、
+不创建 LLM 客户端，也不发起网络调用。
+    """
 
     parser = argparse.ArgumentParser(description="管理已保存的 patch 提案")
     subparsers = parser.add_subparsers(dest="patch_command", required=True)
@@ -126,7 +165,13 @@ def _patch_error_text(result: dict[str, object]) -> str:
 
 
 def _run_patch_command(args: argparse.Namespace) -> int:
-    """运行不依赖 LLM/agent 的确定性 patch 子命令。"""
+    """执行 patch 子命令并输出标准 JSON。
+
+执行边界：
+- `list/show/apply/reject` 全部在本地 repo_tools 完成。
+- 成功仅返回 0；失败统一输出 stderr 并返回 1。
+- `apply/reject` 之后的副作用由 tools 层约束（备份、回滚、白名单测试）。
+    """
 
     try:
         repository_tools = RepositoryTools(Path(args.repo_path).expanduser().resolve())
@@ -172,7 +217,14 @@ def _run_patch_command(args: argparse.Namespace) -> int:
 
 
 class CliApplyPatchApproval:
-    """CLI 模式下的 apply_patch 确认门。"""
+    """CLI 模式下的 apply_patch 确认门。
+
+`CodeAnalysisAgent` 在 answer 流程中可生成 apply_patch 的工具调用，
+该类把真正的“是否落盘”分离为三种模式：
+- `manual_pending`：返回 pending_approval，不写文件；
+- `manual`：交互式读取用户输入（yes/y/approve）；
+- `auto_for_eval`：仅评测上下文下允许自动批准。
+"""
 
     def __init__(
         self,
@@ -190,7 +242,11 @@ class CliApplyPatchApproval:
         self.eval_run_id = eval_run_id
 
     def run_tool(self, tool_call: dict[str, object]) -> object:
-        """执行工具调用，并在 apply_patch 前要求人工确认。"""
+        """执行工具调用，并对 apply_patch 实施审批边界。
+
+除了 `apply_patch` 外，其他工具保持透传；
+`apply_patch` 走人工审批后才交给 RepositoryTools 执行。
+        """
 
         if tool_call.get("tool") != "apply_patch":
             return self.repository_tools.run_tool(tool_call)
@@ -220,6 +276,11 @@ class CliApplyPatchApproval:
         tool_call: dict[str, object],
         patch_id: str,
     ) -> object:
+        """评测模式下的非交互执行。
+
+在 auto_for_eval 模式里只允许通过 eval 安全目录校验（marker）后执行，
+避免误将真实仓库直接作为测试目录执行应用动作。
+        """
         eval_run_id = self.eval_run_id if self.eval_run_id is not None else ""
         try:
             validate_eval_temp_repo(self.repository_tools.repo_root, eval_run_id)
@@ -230,6 +291,8 @@ class CliApplyPatchApproval:
         return self.repository_tools.run_tool(tool_call)
 
     def _manual_pending_apply_result(self, patch_info: dict[str, Any]) -> dict[str, object]:
+        """返回 pending_approval 响应，并给出用户下一步命令清单。"""
+
         patch_id = str(patch_info["patch_id"])
         return {
             "ok": True,
@@ -247,6 +310,12 @@ class CliApplyPatchApproval:
         }
 
     def _extract_patch_id(self, tool_call: dict[str, object]) -> str:
+        """从工具调用参数中提取 patch_id。
+
+该提取只是签名与边界校验，不涉及文件系统路径拼接，确保未经过滤输入
+不会提前触发文件写入。
+        """
+
         tool_args = tool_call.get("args")
         if not isinstance(tool_args, dict):
             raise ToolError("args 必须是对象")
@@ -258,6 +327,12 @@ class CliApplyPatchApproval:
         return patch_id.strip()
 
     def _load_patch_info(self, patch_id: str) -> dict[str, Any]:
+        """读取并校验 patch 元数据与 diff 目标文件。
+
+关键边界：
+- `metadata.paths` 与 diff 解析出的路径必须一致；
+- 不一致时拒绝返回，防止越权修改非预期文件集合。
+        """
         self.repository_tools._validate_patch_id(patch_id)
         patch_text = self.repository_tools._read_patch_file(patch_id)
         metadata = self.repository_tools._read_patch_metadata(patch_id)
@@ -290,6 +365,10 @@ class CliApplyPatchApproval:
         }
 
     def _print_confirmation_prompt(self, patch_info: dict[str, Any]) -> None:
+        """展示待确认差异内容与风险提示。
+
+打印内容只用于用户决策，未在任何环节落盘，属于只读提示层。
+        """
         print("\napply_patch requires human approval before files are modified.")
         print(f"Patch ID: {patch_info['patch_id']}")
         print(f"Patch path: {patch_info['patch_path']}")
@@ -311,6 +390,7 @@ class CliApplyPatchApproval:
         approved: bool,
         approval_mode: str,
     ) -> None:
+        """将审批结果追加到事件日志，供审计和追踪。"""
         status = "approved" if approved else "rejected"
         details: dict[str, object] = {"approved": approved}
         if approval_mode == "auto_for_eval":
@@ -324,7 +404,15 @@ class CliApplyPatchApproval:
 
 
 def main() -> int:
-    """运行命令行程序。"""
+    """运行命令行程序。
+
+主流程按以下顺序构建运行上下文：
+1. 解析参数。
+2. 创建 `RunLogger`（INIT 阶段）并记录 `model_profile`。
+3. 构建 `RepositoryTools`、`LlmClient`、`CodeAnalysisAgent`。
+4. 通过 approval gate 约束 apply_patch。
+5. 输出答案并返回 0，异常时写入 error 并返回 1。
+    """
 
     args = parse_args()
     if getattr(args, "command", "answer") == "patch":
@@ -332,6 +420,7 @@ def main() -> int:
 
     repo_path = Path(args.repo_path).expanduser().resolve()
     question = str(args.question).strip()
+    model_profile = str(args.model_profile)
     if not question:
         print("错误: question 不能为空", file=sys.stderr)
         return 1
@@ -340,8 +429,9 @@ def main() -> int:
     try:
         repository_tools = RepositoryTools(repo_path)
         run_logger = RunLogger(repo_path=repo_path, user_task=question)
-        llm_config = load_llm_config_from_env()
-        llm_client = LlmClient(llm_config)
+        run_logger.payload["model_profile"] = model_profile
+        run_logger.save()
+        llm_client = LlmClient(model_profile=model_profile)
         approval_gate = CliApplyPatchApproval(
             repository_tools,
             approval_mode="manual_pending",

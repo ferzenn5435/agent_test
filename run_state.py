@@ -1,4 +1,8 @@
-"""v0.6 运行状态机。"""
+"""v0.6 运行状态机。
+
+状态机约束 PLAN→EXECUTE→VERIFY 相关阶段，包含 AWAITING_APPROVAL 和
+REPAIR 的单次修复路径。
+"""
 
 from __future__ import annotations
 
@@ -25,7 +29,10 @@ class RunStateError(ValueError):
 
 @dataclass(frozen=True)
 class RunState:
-    """记录 v0.6 plan-execute-verify 运行状态。"""
+    """记录 v0.6 plan-execute-verify 运行状态与副作用。
+
+字段包括：当前阶段、阶段历史、计划、执行步/变更文件、验证结果与上下文统计。
+"""
 
     stage: str = "INIT"
     stage_history: tuple[str, ...] = ("INIT",)
@@ -37,6 +44,7 @@ class RunState:
     context_stats: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
+        """校验对象创建时的阶段、历史与 repair_attempt 边界。"""
         if self.stage not in LEGAL_STAGES:
             raise RunStateError(f"非法 stage: {self.stage}")
         if not self.stage_history:
@@ -49,14 +57,20 @@ class RunState:
             raise RunStateError("repair_attempts 最多只能为 1")
 
     def with_plan(self, plan: TaskPlan) -> RunState:
-        """记录已生成的计划。"""
+        """在 PLAN 阶段绑定当前执行 plan。
+
+该操作仅允许在 PLAN 阶段进行，避免跨阶段复用 plan。
+"""
 
         if self.stage != "PLAN":
             raise RunStateError("只能在 PLAN stage 记录 plan")
         return replace(self, plan=plan)
 
     def with_execution_step(self, execution_step: str) -> RunState:
-        """追加执行步骤记录。"""
+        """追加一个 plan_step_id 到 execution_steps。
+
+仅允许 EXECUTE/REPAIR 阶段写入，保持执行路径可回溯。
+"""
 
         if self.stage not in {"EXECUTE", "REPAIR"}:
             raise RunStateError("只能在 EXECUTE/REPAIR stage 记录 execution_steps")
@@ -68,7 +82,10 @@ class RunState:
         )
 
     def with_changed_file(self, changed_file: str) -> RunState:
-        """追加变更文件记录。"""
+        """追加已变更文件路径。
+
+仅允许 EXECUTE/REPAIR 阶段写入，路径统一斜杠后入库。
+"""
 
         if self.stage not in {"EXECUTE", "REPAIR"}:
             raise RunStateError("只能在 EXECUTE/REPAIR stage 记录 changed_files")
@@ -80,19 +97,25 @@ class RunState:
         )
 
     def with_tests_result(self, tests_result: VerificationResult) -> RunState:
-        """记录验证结果。"""
+        """在 VERIFY 阶段记录 tests_result。
+
+防止在非 VERIFY 阶段提前注入验证状态。
+"""
 
         if self.stage != "VERIFY":
             raise RunStateError("只能在 VERIFY stage 记录 tests_result")
         return replace(self, tests_result=tests_result)
 
     def with_context_stats(self, context_stats: dict[str, object]) -> RunState:
-        """记录上下文统计。"""
+        """存储可序列化的上下文统计副本。"""
 
         return replace(self, context_stats=dict(context_stats))
 
     def transition(self, next_stage: str, reason: str | None = None) -> RunState:
-        """执行硬约束状态迁移，非法迁移直接抛错。"""
+        """执行并校验阶段迁移。
+
+迁移前会检查 LEGAL_TRANSITIONS，并对 REPAIR 进行 reason 与次数约束校验。
+"""
 
         if next_stage not in LEGAL_STAGES:
             raise RunStateError(f"非法 next_stage: {next_stage}")
@@ -112,7 +135,7 @@ class RunState:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """返回稳定、可 JSON 序列化的 primitive schema。"""
+        """返回可直接 JSON 序列化的运行状态快照。"""
 
         return {
             "stage": self.stage,
@@ -126,6 +149,7 @@ class RunState:
         }
 
     def _validate_repair_transition(self, reason: str | None) -> None:
+        """检查 REPAIR 触发条件：未尝试过、reason 合法、tests_result 失败。"""
         if self.repair_attempts >= 1:
             raise RunStateError("repair transition 最多允许一次")
         if reason != "tests_failed":

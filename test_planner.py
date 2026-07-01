@@ -1,4 +1,4 @@
-"""v0.6 planner unit tests."""
+"""v0.6 planner 单元测试。"""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _valid_analysis_json_str() -> str:
 
 
 class FakeLlmClient:
-    """Minimal fake LLM that satisfies LlmClientProtocol."""
+    """满足 LlmClientProtocol 的最小 fake LLM，按预设输出列表依次返回。"""
 
     def __init__(self, outputs: list[str]) -> None:
         self.outputs = list(outputs)
@@ -103,7 +103,7 @@ class FakeLlmClient:
 
 
 class TestBuildPlannerPrompt(unittest.TestCase):
-    """Verify planner prompt construction."""
+    """验证 planner prompt 构造。"""
 
     def test_includes_user_task(self) -> None:
         prompt = build_planner_prompt("modify entry", VALID_INSPECT_REPO, 8)
@@ -134,7 +134,7 @@ class TestBuildPlannerPrompt(unittest.TestCase):
 
 
 class TestValidateLlmOutput(unittest.TestCase):
-    """Verify LLM output validation."""
+    """验证 LLM 输出校验逻辑。"""
 
     def test_accepts_plain_json_object(self) -> None:
         result = _validate_llm_output('{"task_type": "analysis"}')
@@ -178,7 +178,7 @@ class TestValidateLlmOutput(unittest.TestCase):
 
 
 class TestParsePlanSteps(unittest.TestCase):
-    """Verify steps parsing."""
+    """验证步骤解析逻辑。"""
 
     def test_parses_valid_steps(self) -> None:
         raw_steps = [
@@ -228,7 +228,7 @@ class TestParsePlanSteps(unittest.TestCase):
 
 
 class TestParseMustContainRules(unittest.TestCase):
-    """Verify must_contain parsing."""
+    """验证 must_contain 解析逻辑。"""
 
     def test_parses_valid_rules(self) -> None:
         raw_rules = [
@@ -257,7 +257,7 @@ class TestParseMustContainRules(unittest.TestCase):
 
 
 class TestParseVerificationSpecs(unittest.TestCase):
-    """Verify verification parsing."""
+    """验证 verification 解析逻辑。"""
 
     def test_parses_with_must_contain(self) -> None:
         raw_verification = [
@@ -288,7 +288,7 @@ class TestParseVerificationSpecs(unittest.TestCase):
 
 
 class TestParseExpectedChangedFiles(unittest.TestCase):
-    """Verify expected_changed_files parsing."""
+    """验证 expected_changed_files 解析逻辑。"""
 
     def test_parses_string_list(self) -> None:
         result = _parse_expected_changed_files(["src/a.py", "docs/readme.md"])
@@ -311,7 +311,7 @@ class TestParseExpectedChangedFiles(unittest.TestCase):
             _parse_expected_changed_files([""])
 
 class TestBuildTaskPlanFromDict(unittest.TestCase):
-    """Verify building TaskPlan from parsed dict."""
+    """验证从解析后的 dict 构建 TaskPlan。"""
 
     def test_builds_valid_edit_plan(self) -> None:
         plan = _build_task_plan_from_dict(VALID_EDIT_JSON, max_steps=5)
@@ -427,7 +427,7 @@ class TestBuildTaskPlanFromDict(unittest.TestCase):
 
 
 class TestCreatePlanWithFakeLlm(unittest.TestCase):
-    """Verify create_plan end-to-end with fake LLM."""
+    """验证 create_plan 端到端流程（使用 fake LLM）。"""
 
     def test_valid_edit_plan(self) -> None:
         fake_llm = FakeLlmClient([_valid_edit_json_str()])

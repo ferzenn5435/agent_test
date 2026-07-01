@@ -1,4 +1,8 @@
-"""v0.6 计划执行验证 schema。"""
+"""v0.6 运行协议与验证 schema。
+
+定义任务计划、执行步骤、验证结果与最终运行结果的约束。
+字段校验失败将抛出 SchemaValidationError，阻止非法计划入场。
+"""
 
 from __future__ import annotations
 
@@ -15,7 +19,10 @@ class SchemaValidationError(ValueError):
 
 @dataclass(frozen=True)
 class MustContainRule:
-    """单条文件内容验证规则。"""
+    """单条文件内容验证规则。
+
+用于验证器中检查输出文件是否包含指定字符串集合。
+"""
 
     path: str
     strings: tuple[str, ...]
@@ -40,7 +47,7 @@ class MustContainRule:
 
 @dataclass(frozen=True)
 class VerificationSpec:
-    """计划要求执行的确定性验证规则。"""
+    """计划要求执行的确定性验证规则集合。"""
 
     must_contain: tuple[MustContainRule, ...] = ()
 
@@ -62,7 +69,11 @@ class VerificationSpec:
 
 @dataclass(frozen=True)
 class PlanStep:
-    """计划中的单个执行步骤。"""
+    """计划中的单个执行步骤。
+
+step id/title/description 将用于 planner 与 execute 提示词中的
+计划绑定与执行定位。
+"""
 
     id: str
     title: str
@@ -86,7 +97,15 @@ class PlanStep:
 
 @dataclass(frozen=True)
 class TaskPlan:
-    """v0.6 任务计划。"""
+    """v0.6 任务计划。
+
+约束重点：
+- task_type ∈ {analysis, edit, refactor, test}
+- risk_level ∈ {low, medium, high}
+- max_steps 为正整数，steps 数量不允许超过 max_steps
+- edit/refactor 必须声明 verification
+- requires_patch 时 expected_changed_files 非空
+"""
 
     task_type: str
     risk_level: str
@@ -150,7 +169,10 @@ class TaskPlan:
 
 @dataclass(frozen=True)
 class VerificationResult:
-    """单条验证命令结果?"""
+    """单条验证命令结果。
+
+包含命令名、是否通过、退出码、输出摘要、失败原因与可修复性标记。
+"""
 
     command_name: str
     passed: bool
@@ -183,7 +205,11 @@ class VerificationResult:
 
 @dataclass(frozen=True)
 class RunResult:
-    """一次 v0.6 运行的最终结果。"""
+    """一次 v0.6 运行的最终结果。
+
+success 控制总体状态，verification_results 记录阶段验证轨迹，error
+在失败场景提供可读错误串。
+"""
 
     success: bool
     final_answer: str | None = None

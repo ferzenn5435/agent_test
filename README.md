@@ -14,6 +14,7 @@
 - v0.5 提供上下文统计、读取预算和项目索引工具，帮助 agent 先定位再按需读取文件。
 - v0.6 引入 `Plan → Execute → Verify` 运行协议，用确定性校验和最多一次 repair 管住编辑流程。
 - v0.6.1 Pending Approval 让普通非交互编辑任务只生成待审批补丁，不直接修改真实项目文件。
+- v0.7 引入 `model_profiles.json`、`--model-profile` 和多 profile 评测汇总，用统一 profile 管理 default、fast、strong 三类模型配置。
 
 ## 工具
 
@@ -115,11 +116,48 @@ python main.py patch reject --repo . <patch_id>
 
 评测仍使用带 marker 校验的临时 repo 和 `auto_for_eval`，用于避免自动评测被交互审批阻塞。真实 repo 和普通 CLI 不默认自动应用补丁；只有用户运行确定性 `patch apply` 审批后，才会按补丁内容修改文件。
 
+## v0.7 模型 Profile 与评测汇总
+
+v0.7 使用 `model_profiles.json` 描述模型 profile。该文件只保存环境变量名称、provider 类型、超时、重试、输出 token 上限和价格元数据，不保存真实 API key、真实 base URL 或模型密钥值。当前内置 profile 为 `default`、`fast` 和 `strong`，都使用 OpenAI-compatible Chat Completions 接口。
+
+环境变量矩阵：
+
+| profile | base URL 环境变量 | API key 环境变量 | model 环境变量 | 说明 |
+| --- | --- | --- | --- | --- |
+| `default` | `LLM_BASE_URL` | `LLM_API_KEY` | `LLM_MODEL` | 兼容旧配置名称，默认 profile |
+| `fast` | `FAST_LLM_BASE_URL` | `FAST_LLM_API_KEY` | `FAST_LLM_MODEL` | 面向速度优先的模型配置 |
+| `strong` | `STRONG_LLM_BASE_URL` | `STRONG_LLM_API_KEY` | `STRONG_LLM_MODEL` | 面向能力优先的模型配置 |
+
+普通 agent 运行可通过 `--model-profile` 选择 profile：
+
+```powershell
+python main.py --model-profile fast --repo E:\path\to\repo "这个项目的入口文件在哪里？"
+python main.py E:\path\to\repo "这个项目的入口文件在哪里？" --model-profile strong
+```
+
+legacy eval 也支持相同参数：
+
+```powershell
+python run_eval.py --repo . --model-profile fast
+```
+
+多模型编辑评测使用 `run_model_eval.py`：
+
+```powershell
+python run_model_eval.py --profiles default fast strong --trials 3
+```
+
+输出目录固定为 `.repopilot/model_evals/<timestamp>/`，包含 `results.json`、`summary.csv` 和 `summary.md`。`result_data`、运行日志和评测汇总会包含 `model_profile`、`provider`、`model`、调用次数、延迟、token 和 `estimated_cost` 等字段。
+
+token 和 cost 只能作为估算或供应商返回值的记录，不能当作绝对准确数据。token 可能来自 provider usage，也可能在 provider 没有返回 usage 时由本地按文本长度估算；`estimated_cost` 只有在 profile 配置了 pricing 且 token 可计算时才可用，未配置价格时会为空。
+
+安全要求：API key 不能写入日志、评测结果或配置文件，日志和 eval summaries 也不能包含 `Authorization` header。`python main.py patch ...` 子命令保持确定性路径，不加载 `.env`，不读取 `model_profiles.json`，也不初始化 provider 或 LLM。
+
 ## 配置
 
-LLM 调用封装在 `llm_client.py`，默认使用 OpenAI-compatible Chat Completions 接口。
+LLM 调用封装在 `llm_client.py`，默认通过 `model_profiles.json` 的 `default` profile 使用 OpenAI-compatible Chat Completions 接口。
 
-推荐复制 `.env.example` 为 `.env`，然后在 `.env` 中填写本地配置：
+推荐复制 `.env.example` 为 `.env`，然后在 `.env` 中填写本地配置。`default` 继续使用旧环境变量名称：
 
 ```env
 LLM_BASE_URL=https://api.openai.com/v1
@@ -129,12 +167,30 @@ LLM_MODEL=your_model
 
 `.env` 只保存在本地，已被 `.gitignore` 忽略，不会提交密钥。系统环境变量优先级更高；如果系统环境变量和 `.env` 同时存在，程序会使用系统环境变量。
 
+如果要同时配置 fast 和 strong，可以继续使用占位符格式填写各自环境变量，不要把真实密钥写入 `model_profiles.json`：
+
+```env
+FAST_LLM_BASE_URL=https://api.openai.com/v1
+FAST_LLM_API_KEY=your_api_key
+FAST_LLM_MODEL=your_fast_model
+
+STRONG_LLM_BASE_URL=https://api.openai.com/v1
+STRONG_LLM_API_KEY=your_api_key
+STRONG_LLM_MODEL=your_strong_model
+```
+
 也可以直接设置系统环境变量：
 
 ```powershell
 $env:LLM_BASE_URL = "https://api.openai.com/v1"
 $env:LLM_API_KEY = "your_api_key"
 $env:LLM_MODEL = "your_model"
+$env:FAST_LLM_BASE_URL = "https://api.openai.com/v1"
+$env:FAST_LLM_API_KEY = "your_api_key"
+$env:FAST_LLM_MODEL = "your_fast_model"
+$env:STRONG_LLM_BASE_URL = "https://api.openai.com/v1"
+$env:STRONG_LLM_API_KEY = "your_api_key"
+$env:STRONG_LLM_MODEL = "your_strong_model"
 ```
 
 如果你的供应商已经提供完整 endpoint，也可以传入：
@@ -155,6 +211,20 @@ python main.py E:\path\to\repo "这个项目的入口文件在哪里？"
 
 ```powershell
 python main.py --repo E:\path\to\repo "这个项目的入口文件在哪里？"
+```
+
+指定模型 profile：
+
+```powershell
+python main.py --model-profile fast --repo E:\path\to\repo "这个项目的入口文件在哪里？"
+python main.py --model-profile strong E:\path\to\repo "请生成一个修改建议"
+```
+
+运行 eval：
+
+```powershell
+python run_eval.py --repo . --model-profile default
+python run_model_eval.py --profiles default fast strong --trials 3
 ```
 
 程序会打印最终答案，并在 `logs/` 下保存完整运行日志。

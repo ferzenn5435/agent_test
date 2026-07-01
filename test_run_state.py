@@ -17,6 +17,7 @@ from schemas import (
 
 
 def _verification_spec() -> VerificationSpec:
+    """构造包含 must_contain 规则的 VerificationSpec。"""
     return VerificationSpec(
         must_contain=(
             MustContainRule(path="README.md", strings=("安全编辑能力",)),
@@ -25,6 +26,7 @@ def _verification_spec() -> VerificationSpec:
 
 
 def _valid_plan(task_type: str = "analysis") -> TaskPlan:
+    """构造用于测试的有效 TaskPlan，编辑/重构类型会附带 verification。"""
     verification = (_verification_spec(),) if task_type in {"edit", "refactor"} else ()
     return TaskPlan(
         task_type=task_type,

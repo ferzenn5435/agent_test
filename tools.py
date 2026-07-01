@@ -1,4 +1,12 @@
-"""只读代码库工具集合。"""
+"""只读代码库工具集合。
+
+核心目标：在 repo_root 内提供可审计的只读/受控写操作。
+约束原则如下：
+1. 路径沙箱：所有路径先解析为 repo_root 下路径，拒绝越界。
+2. 工具边界：默认不读隐藏目录/文件、敏感文件与二进制。
+3. 补丁边界：只允许 apply pending 的统一差异补丁，带完整元数据与 hash 校验。
+4. 测试边界：仅允许白名单测试命令 unit / compile。
+"""
 
 from __future__ import annotations
 
@@ -39,6 +47,7 @@ SKIPPED_DIR_NAMES = {
     "build",
     "dist",
 }
+# search/search_text 的目录跳过集合：.git/缓存/构建等目录会被直接过滤，避免噪音与性能退化。
 REPO_INDEX_SKIPPED_DIR_NAMES = {
     ".git",
     ".venv",
@@ -49,6 +58,7 @@ REPO_INDEX_SKIPPED_DIR_NAMES = {
     "dist",
     "build",
 }
+# repo 索引扫描的目录跳过集合：与 search 不同，.venv 与日志目录等也会排除。
 SECRET_FILE_NAMES = {
     ".env",
     ".env.local",
@@ -61,6 +71,7 @@ SECRET_FILE_NAMES = {
     "id_ed25519",
     "known_hosts",
 }
+# 名称命中敏感文件（如 .env、SSH key）一律不允许读取或修改。
 SECRET_FILE_SUFFIXES = {
     ".key",
     ".pem",
@@ -91,9 +102,16 @@ class ToolSpec:
 
 
 class RepositoryTools:
-    """面向单个目标代码库的只读工具。"""
+    """面向单个目标代码库的工具集合。
+
+包含路径安全、搜索边界、补丁元数据、备份回滚、测试白名单等基础安全机制。
+"""
+
+    # .repopilot 存放 patch/metadata/backups/runs 日志：
+    # 目的不是“执行权限”，而是审计、恢复和验证证据的保真落盘。
 
     def __init__(self, repo_root: str | Path) -> None:
+        """初始化仓库边界与工具注册清单。"""
         resolved_repo_root = Path(repo_root).expanduser().resolve()
         if not resolved_repo_root.is_dir():
             raise ToolError(f"repo 路径不是目录: {repo_root}")
@@ -633,7 +651,7 @@ class RepositoryTools:
         return touched_paths
 
     def list_patches(self) -> dict[str, object]:
-        """List deterministic patch metadata records from the directory storage."""
+        """读取 patches 目录中的元数据清单（仅审计视图）。"""
 
         patches: list[dict[str, object]] = []
         for patch_dir in sorted(self.repopilot_patches_dir.iterdir(), key=lambda item: item.name):
@@ -659,7 +677,7 @@ class RepositoryTools:
         return {"ok": True, "patches": patches, "errors": []}
 
     def show_patch(self, patch_id: str, full: bool = False) -> dict[str, object]:
-        """Return metadata plus a deterministic diff preview or the full diff."""
+        """读取单个 patch 的 metadata 与 diff（可选 full）。"""
 
         response: dict[str, object] = {
             "ok": False,
@@ -688,7 +706,7 @@ class RepositoryTools:
         return response
 
     def reject_patch(self, patch_id: str) -> dict[str, object]:
-        """Reject a pending patch without touching business files."""
+        """拒绝未应用 patch，不触碰业务文件。"""
 
         response: dict[str, object] = {
             "ok": False,
@@ -714,12 +732,16 @@ class RepositoryTools:
         return response
 
     def apply_pending_patch(self, patch_id: str) -> dict[str, object]:
-        """Compatibility alias for the deterministic pending-approval apply path."""
-
+        """兼容旧入口，实际委托确定性的 pending-approval 应用路径。"""
+    
         return self.apply_patch(patch_id)
 
     def apply_patch(self, patch_id: str) -> dict[str, object]:
-        """Apply a pending patch with deterministic preflight, backup, verification, and rollback."""
+        """应用待审批补丁。
+
+执行顺序固定为：元数据校验 -> patch 校验 -> 备份 -> 写入 -> run_tests 验证 ->
+失败时回滚。状态与回滚结果都写入 metadata 和 runs 事件日志。
+"""
 
         response: dict[str, object] = {
             "ok": False,
@@ -816,6 +838,10 @@ class RepositoryTools:
         return response
 
     def _validate_apply_metadata(self, patch_id: str, metadata: dict[str, object]) -> None:
+        """检查 metadata 与 patch_id 的绑定关系，防止替换/篡改。
+
+必须满足 metadata.patch_id 一致、状态 pending_approval、diff 路径匹配。
+"""
         if metadata.get("patch_id") != patch_id:
             raise ToolError("metadata.patch_id does not match patch_id")
         self._validate_pending_patch_status(metadata)
@@ -858,6 +884,7 @@ class RepositoryTools:
             raise ToolError("metadata.target_files paths do not match patch.diff targets")
 
     def _validate_apply_target_file_state(self, metadata: dict[str, object]) -> None:
+        """校验每个 target_file 的操作类型与当前文件状态匹配。"""
         target_files = metadata.get("target_files")
         if not isinstance(target_files, list):
             raise ToolError("metadata.target_files must be a list")
@@ -1053,6 +1080,10 @@ class RepositoryTools:
             raise ToolError(f"hunk content mismatch: {repo_path} line {source_index + 1}")
 
     def _backup_existing_files(self, patch_id: str, existing_files: list[Path]) -> Path:
+        """写入现有目标文件的备份副本：
+
+备份目录为 .repopilot/backups/<patch_id>，路径保持 repo 相对结构。
+"""
         backup_dir = self.repopilot_backups_dir / patch_id
         if backup_dir.exists():
             shutil.rmtree(backup_dir)
@@ -1069,6 +1100,7 @@ class RepositoryTools:
         patched_files: list[dict[str, object]],
         metadata: dict[str, object],
     ) -> Path:
+        """记录本次 apply 的目标清单（含新建/修改标记）用于回滚审计。"""
         backup_dir = self.repopilot_backups_dir / patch_id
         backup_dir.mkdir(parents=True, exist_ok=True)
         manifest_files: list[dict[str, object]] = []
@@ -1091,6 +1123,7 @@ class RepositoryTools:
         return manifest_path
 
     def _rollback_patch_apply(self, patch_id: str, existing_files: list[Path], new_files: list[Path]) -> dict[str, object]:
+        """回滚 apply：恢复备份文件 + 删除新建文件。"""
         rollback_errors: list[str] = []
         rollback_files: list[dict[str, object]] = []
         backup_dir = self.repopilot_backups_dir / patch_id
@@ -1148,7 +1181,11 @@ class RepositoryTools:
         return normalized_answer
 
     def run_tests(self, command_name: str) -> dict[str, object]:
-        """执行白名单内的测试命令。"""
+        """执行白名单测试。
+
+明确只允许：unit（python -m unittest discover）、compile（python -m compileall .）。
+不接受任意 shell 命令字符串，避免任意命令执行风险。
+"""
 
         normalized_command_name = self._validate_run_command_name(command_name)
         command_map = {
@@ -1255,6 +1292,7 @@ class RepositoryTools:
         }
 
     def _validate_run_command_name(self, command_name: str) -> str:
+        """只接受 unit / compile 两种命令名。"""
         if not isinstance(command_name, str) or not command_name.strip():
             raise ToolError("command_name 必须是非空字符串")
 
@@ -1317,6 +1355,7 @@ class RepositoryTools:
         return json.dumps({"ok": True, "output": tool_output}, ensure_ascii=False, indent=2)
 
     def _resolve_repo_path(self, path: str) -> Path:
+        """将用户输入路径解析到 repo_root 内（路径沙箱）。"""
         if not isinstance(path, str) or not path.strip():
             raise ToolError("path 必须是非空字符串")
 
@@ -1368,6 +1407,7 @@ class RepositoryTools:
         status: str = "pending_approval",
         created_at: datetime | None = None,
     ) -> dict[str, object]:
+        """构建 patch 元数据，作为 apply/回滚/审计的权威输入。"""
         self._validate_patch_id(patch_id)
         if not isinstance(instruction, str) or not instruction.strip():
             raise ToolError("instruction 必须是非空字符串")
@@ -1409,6 +1449,7 @@ class RepositoryTools:
         }
 
     def _write_patch_file(self, patch_id: str, patch_text: str) -> Path:
+        """持久化统一差异到 .repopilot/patches/<patch_id>/patch.diff。"""
         self._validate_patch_id(patch_id)
         if not isinstance(patch_text, str):
             raise ToolError("patch_text 必须是字符串")
@@ -1432,6 +1473,7 @@ class RepositoryTools:
         return patch_path.read_text(encoding="utf-8")
 
     def _write_patch_metadata(self, metadata: dict[str, object]) -> Path:
+        """持久化 patch metadata.json，并采用可审计 JSON 格式。"""
         patch_id = metadata.get("patch_id")
         if not isinstance(patch_id, str):
             raise ToolError("metadata.patch_id 必须是字符串")
@@ -1543,6 +1585,10 @@ class RepositoryTools:
                 legacy_path.unlink()
 
     def _build_patch_target_files(self, touched_paths: list[str]) -> list[dict[str, object]]:
+        """生成目标文件快照列表。
+
+包含 existed_before 与 sha256_before，用于后续 apply 时判定 state 是否被改写。
+"""
         target_files: list[dict[str, object]] = []
         for touched_path in touched_paths:
             target_path = self._validate_diff_target_path(touched_path, must_exist=False)
@@ -1634,6 +1680,7 @@ class RepositoryTools:
         return self._parse_prefixed_diff_path(raw_path, expected_prefix, line_number)
 
     def _validate_diff_target_path(self, repo_path: str, must_exist: bool) -> Path:
+        """校验 diff 目标路径边界：禁止绝对路径、路径穿越、隐藏/.git/secret 与 symlink。"""
         if Path(repo_path).is_absolute():
             raise ToolError("diff 路径必须是 repo 内相对路径，不能使用绝对路径")
         if any(path_part == ".." for path_part in Path(repo_path).parts):
@@ -1656,6 +1703,7 @@ class RepositoryTools:
         return target_path
 
     def _reject_symlink_path(self, target_path: Path) -> None:
+        """逐级拒绝路径中间组件为符号链接，避免通过链接改写受限路径。"""
         current_path = self.repo_root
         for path_part in target_path.relative_to(self.repo_root).parts:
             current_path = current_path / path_part
@@ -1669,6 +1717,7 @@ class RepositoryTools:
             raise ToolError("不支持 rename/copy 补丁")
 
     def _iter_searchable_files(self) -> list[Path]:
+        """返回可被 search_text 遍历的文件列表（已应用目录/文件跳过规则）。"""
         searchable_files: list[Path] = []
         for current_dir, dir_names, file_names in os.walk(self.repo_root):
             dir_names[:] = [
@@ -1687,6 +1736,7 @@ class RepositoryTools:
         return sorted(searchable_files, key=lambda item: self._format_repo_path(item).lower())
 
     def _iter_repo_index_files(self) -> list[Path]:
+        """返回 repo 索引遍历文件列表，遵循 REPO_INDEX_SKIPPED_DIR_NAMES。"""
         indexed_files: list[Path] = []
         for current_dir, dir_names, file_names in os.walk(self.repo_root, topdown=True):
             dir_names[:] = [
@@ -1952,9 +2002,14 @@ class RepositoryTools:
         return repo_index
 
     def _should_skip_dir(self, dir_name: str) -> bool:
+        """判断目录是否进入 os.walk：隐藏目录与 SKIPPED_DIR_NAMES 一律跳过。"""
         return dir_name.startswith(".") or dir_name in SKIPPED_DIR_NAMES
 
     def _should_skip_file(self, file_path: Path) -> bool:
+        """判断单个文件是否参与检索：
+
+条件为：路径越界、隐藏路径、敏感文件、超大文件（非 .py）或二进制。
+"""
         try:
             resolved_file_path = file_path.resolve()
             resolved_file_path.relative_to(self.repo_root)
@@ -2021,10 +2076,15 @@ class RepositoryTools:
         ]
 
     def _has_hidden_path_part(self, file_path: Path) -> bool:
+        """判断相对路径中是否含隐藏目录/文件（以 "." 开头）。"""
         relative_parts = file_path.relative_to(self.repo_root).parts
         return any(part.startswith(".") for part in relative_parts)
 
     def _is_secret_file(self, file_path: Path) -> bool:
+        """判断文件名是否命中秘钥/环境文件名单。
+
+命中后在 read/search/patch 阶段统一禁止读取或写入。
+"""
         file_name = file_path.name.lower()
         return file_name in SECRET_FILE_NAMES or file_path.suffix.lower() in SECRET_FILE_SUFFIXES
 

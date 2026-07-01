@@ -1,4 +1,4 @@
-"""Deterministic verifier unit tests."""
+"""确定性验证器单元测试。"""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from verifier import (
 
 
 def _write_repo(repo_root: Path) -> None:
+    """在临时目录中创建验证测试所需的最小代码库文件。"""
     (repo_root / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     (repo_root / "README.md").write_text(
         "This project validates safe editing ability.\n",
@@ -30,6 +31,7 @@ def _write_repo(repo_root: Path) -> None:
 
 
 def _plan() -> TaskPlan:
+    """构造一个编辑型 TaskPlan，含 must_contain 验证和测试要求。"""
     return TaskPlan(
         task_type="edit",
         risk_level="low",
@@ -62,6 +64,7 @@ def _finished_state(
     execution_steps: tuple[str, ...] = ("inspect", "verify"),
     context_stats: dict[str, object] | None = None,
 ) -> RunState:
+    """构造一个处于完成阶段（FINISH）的 RunState 用于验证测试。"""
     return RunState(
         stage=stage,
         stage_history=("INIT", "PLAN", "EXECUTE", "VERIFY", stage),
@@ -74,6 +77,7 @@ def _finished_state(
 
 
 def _awaiting_approval_state() -> RunState:
+    """构造一个处于等待审批阶段的 RunState。"""
     return RunState(
         stage="AWAITING_APPROVAL",
         stage_history=("INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL"),
@@ -85,6 +89,7 @@ def _awaiting_approval_state() -> RunState:
 
 
 def _finished_pending_approval_state() -> RunState:
+    """构造一个经历等待审批后最终完成的 RunState。"""
     return RunState(
         stage="FINISH",
         stage_history=("INIT", "PLAN", "EXECUTE", "AWAITING_APPROVAL", "FINISH"),

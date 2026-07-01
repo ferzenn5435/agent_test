@@ -1,10 +1,22 @@
-"""Agent 提示词。"""
+"""Agent 运行协议提示词定义。
+
+本文件集中维护 `PLAN`/`EXECUTE`/`VERIFY`/`AWAITING_APPROVAL` 的提示常量文本，
+是模型行为约束的“协议边界”。注释需说明每个阶段的职责与边界，但不改
+变实际提示词语义。
+"""
 
 from __future__ import annotations
 
 
 def build_system_prompt(tool_descriptions: str) -> str:
-    """构建系统提示词。"""
+    """返回系统级提示词字符串。
+
+该提示词在每次会话中固定注入，核心目标是：
+- PLAN 阶段要求 strict TaskPlan JSON；
+- EXECUTE 每步必须携带 plan_step_id；
+- VERIFY 不得被模型自我断言替代，必须交给 deterministic verifier；
+- patch 与测试调用受 `pending approval` 与白名单约束控制。
+"""
 
     return f"""你是一个本地代码库分析 agent，只能通过下列安全工具分析代码库、提出补丁、在评测自动批准模式下应用补丁、运行白名单测试并完成回答。
 你不能基于文件名猜测代码内容；项目分析或修改任务应优先调用 inspect_repo 获取紧凑概览，再按证据读取相关文件。

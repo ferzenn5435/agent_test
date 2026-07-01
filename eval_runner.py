@@ -1,4 +1,12 @@
-"""Edit 评测用例加载器。"""
+"""Edit 评测用例加载器。
+
+该模块负责 edit 评测的核心执行流程：
+1. 加载 eval case；
+2. 为每个 case 拷贝 fixture 到临时仓库；
+3. 运行 agent 并采集 run log、变更统计；
+4. 对变更文件、must_contain、上下文与日志约束做统一校验；
+5. 输出可汇总的结果（含失败分类）。
+"""
 
 from __future__ import annotations
 
@@ -71,6 +79,29 @@ class EditEvalResult:
     error: str | None
     test_results: dict[str, object] | None
     context_stats: dict[str, object] | None
+    model_profile: str | None
+    provider: str | None
+    model: str | None
+    llm_call_count: int
+    total_latency_ms: float
+    total_tokens: int
+    estimated_tokens: int
+    estimated_cost: float | None
+    failure_type: str | None
+
+
+@dataclass(frozen=True)
+class EvalResultMetrics:
+    """eval result 中复用的模型和用量字段。"""
+
+    model_profile: str | None
+    provider: str | None
+    model: str | None
+    llm_call_count: int
+    total_latency_ms: float
+    total_tokens: int
+    estimated_tokens: int
+    estimated_cost: float | None
 
 
 @dataclass(frozen=True)
@@ -92,7 +123,14 @@ class RepoSnapshotDiff:
 
 
 def copy_fixture_to_temp(fixture_path: Path, temp_root: Path, run_id: str, case_id: str) -> Path:
-    """复制 fixture repo 到 eval 临时目录并写入安全 marker。"""
+    """复制 fixture repo 到 eval 临时目录并写入安全 marker。
+
+注：fixture 在 eval 中必须只读使用原始数据，
+真实仓库和 eval fixture 本体不能被 agent 直接改写。
+通过 copytree 到独立临时目录后，
+可在不影响真实文件的情况下执行 apply_patch、run_tests 等操作，
+并且后续会话结束后由临时目录生命周期自动回收。
+    """
 
     if not fixture_path.is_dir():
         raise EditEvalConfigError(f"fixture 路径不是目录: {fixture_path}")
@@ -109,7 +147,12 @@ def copy_fixture_to_temp(fixture_path: Path, temp_root: Path, run_id: str, case_
 
 
 def snapshot_repo_files(repo_path: Path) -> dict[str, RepoFileSnapshot]:
-    """生成 repo 内普通文件快照，跳过 eval 内部文件和缓存目录。"""
+    """生成 repo 内普通文件快照，跳过 eval 内部文件和缓存目录。
+
+该快照仅记录 `relative_path -> sha256`，用于后续和执行前快照做 hash 对比。
+通过排除 EVAL_TEMP_MARKER 与缓存目录，避免把运行标记与无关副产物
+误判为业务变更。
+    """
 
     if not repo_path.is_dir():
         raise EditEvalConfigError(f"repo 路径不是目录: {repo_path}")
@@ -143,7 +186,15 @@ def compare_snapshots(
     before: Mapping[str, RepoFileSnapshot],
     after: Mapping[str, RepoFileSnapshot],
 ) -> RepoSnapshotDiff:
-    """比较两次 repo 文件快照。"""
+    """比较两次 repo 文件快照。
+
+用于定位编辑过程中的：
+- 新增文件；
+- 修改文件（hash 变化）；
+- 删除文件。
+
+这些字段会汇总到 `changed_files`，驱动 allowed_changed_files 等后续判定。
+    """
 
     before_paths = set(before)
     after_paths = set(after)
@@ -169,7 +220,12 @@ def check_allowed_changed_files(
     changed_files: Iterable[str],
     allowed_changed_files: Iterable[str],
 ) -> list[str]:
-    """校验实际变更文件是否都在允许列表中。"""
+    """校验实际变更文件是否都在允许列表中。
+
+规则含义：allowed_changed_files 是严格授权边界。
+只要实际变更出现任何不在 allowed_changed_files 内的相对路径，
+eval 即判定违规。
+    """
 
     errors: list[str] = []
     allowed_paths: set[str] = set()
@@ -192,7 +248,11 @@ def check_allowed_changed_files(
 
 
 def check_must_contain(repo_path: Path, rules: Iterable[MustContainRule | Mapping[str, object]]) -> list[str]:
-    """校验指定文件必须包含的文本。"""
+    """校验指定文件必须包含的文本。
+
+这是对结果正确性的“快照断言”机制：
+agent 可合法修改文件，但必须让目标文件中出现预期文本。
+    """
 
     errors: list[str] = []
     resolved_repo_path = repo_path.resolve()
@@ -231,7 +291,13 @@ def check_must_contain(repo_path: Path, rules: Iterable[MustContainRule | Mappin
 
 
 def load_edit_cases(cases_path: Path) -> list[EditEvalCase]:
-    """从 JSON 文件加载编辑评测用例。"""
+    """从 JSON 文件加载编辑评测用例。
+
+在加载阶段完成严格验参，确保以下字段一致可用：
+`id`、`fixture`、`prompt`、`max_steps`、`allowed_changed_files`、`must_contain`，
+并解析可选字段（上下文与日志约束）。
+这样后续执行阶段不再依赖弱校验，便于将输入错误与执行失败分离。
+    """
 
     try:
         raw_cases = json.loads(cases_path.read_text(encoding="utf-8"))
@@ -348,7 +414,17 @@ def run_edit_case(
     project_root: Path,
     llm_client_factory: Callable[..., Any] | None = None,
 ) -> EditEvalResult:
-    """在隔离临时目录中执行单条 edit eval 用例。"""
+    """在隔离临时目录中执行单条 edit eval 用例。
+
+执行顺序为：
+1. 解析 fixture 路径；
+2. 拷贝到临时 repo；
+3. 执行前后拍快照；
+4. 对比 diff 得出变更文件；
+5. 按 allowed_changed_files、must_contain、上下文与日志约束给出 reasons。
+
+核心价值：评测过程不触碰真实仓库，`project_root` 仅用于 fixture 定位。
+    """
 
     run_id = f"edit-eval-{uuid.uuid4().hex}"
     changed_files: tuple[str, ...] = ()
@@ -357,6 +433,7 @@ def run_edit_case(
     error_message: str | None = None
     test_results: dict[str, object] | None = None
     context_stats: dict[str, object] | None = None
+    run_log_payload: Mapping[str, object] | None = None
     reasons: list[str] = []
 
     try:
@@ -374,6 +451,7 @@ def run_edit_case(
                 run_id=run_id,
                 case_id=case.id,
             )
+            # 在 agent 实际写入前拍摄基线，避免把初始 fixture 状态当成“变更”统计。
             before_snapshot = snapshot_repo_files(temp_repo)
             repository_tools = RepositoryTools(temp_repo)
             run_logger = RunLogger(
@@ -402,6 +480,7 @@ def run_edit_case(
                 case_exception = error
 
             try:
+                # 执行后再次拍摄快照并比对：新增/修改/删除文件共同构成 changed_files。
                 after_snapshot = snapshot_repo_files(temp_repo)
                 snapshot_diff = compare_snapshots(before_snapshot, after_snapshot)
                 changed_files = snapshot_diff.changed_files
@@ -412,15 +491,15 @@ def run_edit_case(
             final_answer = _optional_string(run_logger.payload.get("final_answer"))
             error_message = _optional_string(run_logger.payload.get("error"))
             context_stats = _optional_context_stats(run_logger.payload.get("context_stats"))
+            run_log_payload = run_logger.payload
             reasons.extend(_check_context_constraints(case, context_stats))
             reasons.extend(_check_run_log_constraints(case, run_logger.payload))
 
             if case_exception is not None:
                 error_message = str(case_exception)
                 reasons.append(f"case 执行异常: {case_exception}")
-                return EditEvalResult(
+                return _build_edit_eval_result(
                     case_id=case.id,
-                    passed=False,
                     reasons=tuple(reasons),
                     changed_files=changed_files,
                     steps=steps,
@@ -428,6 +507,7 @@ def run_edit_case(
                     error=error_message,
                     test_results=test_results,
                     context_stats=context_stats,
+                    payload=run_logger.payload,
                 )
 
             if not _logger_finished(run_logger):
@@ -461,9 +541,8 @@ def run_edit_case(
         error_message = str(error)
         reasons.append(f"case 执行异常: {error}")
 
-    return EditEvalResult(
+    return _build_edit_eval_result(
         case_id=case.id,
-        passed=not reasons,
         reasons=tuple(reasons),
         changed_files=changed_files,
         steps=steps,
@@ -471,6 +550,7 @@ def run_edit_case(
         error=error_message,
         test_results=test_results,
         context_stats=context_stats,
+        payload=run_log_payload,
     )
 
 
@@ -479,7 +559,15 @@ def run_edit_eval(
     project_root: Path,
     llm_client_factory: Callable[..., Any] | None = None,
 ) -> dict[str, object]:
-    """加载并连续执行 edit eval 用例，单条失败不影响后续用例。"""
+    """加载并连续执行 edit eval 用例，单条失败不影响后续用例。
+
+返回值是批次级别聚合结果：
+- total：用例总数；
+- passed：通过数；
+- pass_rate：通过率；
+- results：逐条 `EditEvalResult` 转成 dict。
+用于 CLI 与 report 文件复用同一语义字段，便于统一汇总。
+    """
 
     cases = load_edit_cases(cases_path)
     results = [
@@ -492,6 +580,7 @@ def run_edit_eval(
     ]
     passed_count = sum(1 for result in results if result.passed)
     total_count = len(results)
+    # 通过率基于总用例计算，单条失败仍会继续执行后续用例。
     pass_rate = passed_count / total_count if total_count else 0.0
 
     return {
@@ -500,6 +589,144 @@ def run_edit_eval(
         "pass_rate": pass_rate,
         "results": [asdict(result) for result in results],
     }
+
+
+def classify_failure_type(
+    *,
+    passed: bool,
+    reasons: Sequence[str],
+    error: str | None,
+    test_results: Mapping[str, object] | None,
+    payload: Mapping[str, object] | None = None,
+) -> str | None:
+    """将 eval 失败原因归一到稳定分类，供多个 eval runner 复用。
+
+分类策略按优先级匹配 text 与 test/llm 结果：
+timeout -> invalid_json -> provider_error -> phase/repo/policy 违规 -> 测试失败 -> unknown。
+该函数不抛异常，始终给出可比对的 failure_type。
+    """
+
+    if passed:
+        return None
+
+    combined_text = _combined_failure_text(reasons, error, payload)
+    if _test_timed_out(test_results) or _contains_any(combined_text, ("timeout", "timed out", "超时")):
+        return "timeout"
+    if _contains_any(combined_text, ("模型输出不是严格 json", "不是 json", "invalid json")):
+        return "invalid_json"
+    if _contains_any(combined_text, ("llm http 错误", "llm 网络", "providererror", "provider error")):
+        return "provider_error"
+    if _contains_any(
+        combined_text,
+        (
+            "required_stages 违规",
+            "stage_history",
+            "must_have_plan 违规",
+            "must_reference_plan_steps 违规",
+            "require_verify_after_patch 违规",
+            "max_repair_attempts 违规",
+            "plan_step_id",
+        ),
+    ):
+        return "phase_policy_violation"
+    if _contains_any(combined_text, ("patch 格式", "invalid patch", "补丁格式", "patch_invalid")):
+        return "patch_invalid"
+    if _contains_any(combined_text, ("must_contain 缺少文本", "patch_not_applied")):
+        return "patch_not_applied"
+    if _contains_any(combined_text, ("verify 失败", "verification failed", "verification_failed")):
+        return "verification_failed"
+    if _test_failed(test_results) or _contains_any(combined_text, ("test_command", "tests_failed")):
+        return "test_failed"
+    if _contains_any(combined_text, ("max_steps", "最大循环步数", "未在 max_steps 内")):
+        return "max_steps_exceeded"
+    if _contains_any(
+        combined_text,
+        (
+            "未授权的变更文件",
+            "expect_no_business_changes",
+            "must_not_read_full_files",
+            "max_total_tool_output_chars",
+            "工具安全边界",
+            "不在 repo 内",
+        ),
+    ):
+        return "tool_policy_violation"
+    return "unknown"
+
+
+def _build_edit_eval_result(
+    *,
+    case_id: str,
+    reasons: tuple[str, ...],
+    changed_files: tuple[str, ...],
+    steps: int,
+    final_answer: str | None,
+    error: str | None,
+    test_results: dict[str, object] | None,
+    context_stats: dict[str, object] | None,
+    payload: Mapping[str, object] | None,
+) -> EditEvalResult:
+    passed = not reasons
+    metrics = _extract_eval_result_metrics(payload)
+    return EditEvalResult(
+        case_id=case_id,
+        passed=passed,
+        reasons=reasons,
+        changed_files=changed_files,
+        steps=steps,
+        final_answer=final_answer,
+        error=error,
+        test_results=test_results,
+        context_stats=context_stats,
+        model_profile=metrics.model_profile,
+        provider=metrics.provider,
+        model=metrics.model,
+        llm_call_count=metrics.llm_call_count,
+        total_latency_ms=metrics.total_latency_ms,
+        total_tokens=metrics.total_tokens,
+        estimated_tokens=metrics.estimated_tokens,
+        estimated_cost=metrics.estimated_cost,
+        failure_type=classify_failure_type(
+            passed=passed,
+            reasons=reasons,
+            error=error,
+            test_results=test_results,
+            payload=payload,
+        ),
+    )
+
+
+def _extract_eval_result_metrics(payload: Mapping[str, object] | None) -> EvalResultMetrics:
+    if payload is None:
+        return EvalResultMetrics(
+            model_profile=None,
+            provider=None,
+            model=None,
+            llm_call_count=0,
+            total_latency_ms=0.0,
+            total_tokens=0,
+            estimated_tokens=0,
+            estimated_cost=None,
+        )
+
+    usage_summary = payload.get("usage_summary")
+    if not isinstance(usage_summary, Mapping):
+        usage_summary = {}
+
+    llm_call_count = _optional_int(usage_summary.get("llm_call_count"))
+    if llm_call_count is None:
+        llm_call_count = _optional_int(payload.get("llm_calls")) or 0
+
+    return EvalResultMetrics(
+        model_profile=_optional_string(payload.get("model_profile")),
+        provider=_optional_string(payload.get("provider")),
+        model=_optional_string(payload.get("model")),
+        llm_call_count=llm_call_count,
+        total_latency_ms=_optional_float(usage_summary.get("total_latency_ms")) or 0.0,
+        total_tokens=_optional_int(usage_summary.get("total_tokens")) or 0,
+        estimated_tokens=_optional_int(usage_summary.get("estimated_tokens")) or 0,
+        estimated_cost=_optional_float(usage_summary.get("estimated_cost")),
+    )
 
 
 def _build_eval_agent_prompt(case: EditEvalCase) -> str:
@@ -564,6 +791,60 @@ def _optional_string(value: object) -> str | None:
     return None
 
 
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _contains_any(text: str, needles: Sequence[str]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _combined_failure_text(
+    reasons: Sequence[str],
+    error: str | None,
+    payload: Mapping[str, object] | None,
+) -> str:
+    text_parts = [str(reason) for reason in reasons]
+    if error:
+        text_parts.append(error)
+    if payload is not None:
+        steps = payload.get("steps")
+        if isinstance(steps, list):
+            for raw_step in steps:
+                if not isinstance(raw_step, Mapping):
+                    continue
+                tool_result = raw_step.get("tool_result")
+                if not isinstance(tool_result, Mapping):
+                    continue
+                step_error = tool_result.get("error")
+                if isinstance(step_error, str):
+                    text_parts.append(step_error)
+    return "\n".join(text_parts).lower()
+
+
+def _test_timed_out(test_results: Mapping[str, object] | None) -> bool:
+    return test_results is not None and test_results.get("timed_out") is True
+
+
+def _test_failed(test_results: Mapping[str, object] | None) -> bool:
+    if test_results is None:
+        return False
+    exit_code = test_results.get("exit_code")
+    return isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+
+
 def _optional_context_stats(value: object) -> dict[str, object] | None:
     if isinstance(value, dict):
         return dict(value)
@@ -574,6 +855,13 @@ def _check_context_constraints(
     case: EditEvalCase,
     context_stats: dict[str, object] | None,
 ) -> list[str]:
+    """校验 context_stats 中的工具约束。
+
+当前约束包含：
+- full_file_reads 与 must_not_read_full_files 交集检测；
+- 总工具输出字符数与 max_total_tool_output_chars 上限对比。
+这些约束用于避免 context 滥用与过大输出风险。
+    """
     if context_stats is None:
         return []
 
@@ -607,6 +895,12 @@ def _check_run_log_constraints(
     case: EditEvalCase,
     payload: Mapping[str, object],
 ) -> list[str]:
+    """校验 run log 中的流程约束（plan/stage/repair）。
+
+本函数集中处理：
+must_have_plan、required_stages、must_reference_plan_steps、require_verify_after_patch、
+max_repair_attempts 等字段，统一转换为 reason 列表。
+    """
     errors: list[str] = []
     plan = payload.get("plan")
     stage_history = _normalize_stage_history(payload.get("stage_history"))

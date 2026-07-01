@@ -1,4 +1,11 @@
-"""Edit eval 临时代码库安全标记与路径校验。"""
+"""编辑 eval 临时仓库的安全标记与路径校验。
+
+用途：
+1. 防止 auto_for_eval 使用错误目录。
+2. 通过 marker 绑定 run_id 与仓库根目录。
+3. 通过路径规范化阻断绝对路径、~ 开头、Windows 盘符和目录穿越。
+4. 限制 marker 校验范围，避免把真实仓库误当作 eval 临时目录。
+"""
 
 from __future__ import annotations
 
@@ -11,11 +18,19 @@ EVAL_TEMP_MARKER = ".repopilot_eval_temp.json"
 
 
 class EvalSafetyError(ValueError):
-    """Edit eval 临时代码库安全校验失败。"""
+    """编辑评测临时仓库安全校验失败。"""
 
 
 def normalize_relative_path(path: str) -> str:
-    """规范化 repo 内相对路径，拒绝逃逸或绝对路径。"""
+    """规范化仓库内相对路径。
+
+允许的输入必须是纯相对路径，不可出现：
+- 绝对路径（POSIX / Windows）
+- ~ 或 "/" 开头
+- ".." 穿越片段
+
+返回值直接交给路径解析逻辑使用。
+"""
 
     if not isinstance(path, str):
         raise EvalSafetyError("path 必须是字符串")
@@ -36,7 +51,11 @@ def normalize_relative_path(path: str) -> str:
 
 
 def write_eval_temp_marker(repo_path: Path, run_id: str, case_id: str, temp_root: Path) -> Path:
-    """在 eval 临时代码库根目录写入安全 marker。"""
+    """在临时仓库根目录写入安全 marker。
+
+marker 文件只记录：`run_id`、`case_id`、`temp_root`、`repo_path`。
+所有值均为绝对路径与原始标识，应用时会做严格一致性比对。
+"""
 
     if not isinstance(run_id, str) or not run_id.strip():
         raise EvalSafetyError("run_id 必须是非空字符串")
@@ -62,7 +81,11 @@ def write_eval_temp_marker(repo_path: Path, run_id: str, case_id: str, temp_root
 
 
 def validate_eval_temp_repo(repo_path: Path, run_id: str) -> None:
-    """验证 repo_path 是当前 run_id 绑定的 eval 临时代码库。"""
+    """验证 repo_path 与 run_id 绑定关系。
+
+失败场景包括：marker 文件缺失、JSON 结构非法、run_id 不一致、
+repo_path 不在 temp_root 之内，以及记录路径与当前路径不匹配。
+"""
 
     if not isinstance(run_id, str) or not run_id.strip():
         raise EvalSafetyError("run_id 必须是非空字符串")
@@ -97,10 +120,12 @@ def validate_eval_temp_repo(repo_path: Path, run_id: str) -> None:
 
 
 def _is_windows_absolute_path(value: str) -> bool:
+    """兼容性检查：识别 Windows 盘符绝对路径（如 C:/xxx）。"""
     return re.match(r"^[A-Za-z]:/", value) is not None
 
 
 def _require_marker_path(marker_payload: dict[str, object], field_name: str) -> Path:
+    """取出 marker 字段并转为 Path，字段不存在或为空即报错。"""
     value = marker_payload.get(field_name)
     if not isinstance(value, str) or not value.strip():
         raise EvalSafetyError(f"eval temp marker 缺少有效 {field_name}")
@@ -108,6 +133,7 @@ def _require_marker_path(marker_payload: dict[str, object], field_name: str) -> 
 
 
 def _require_inside_temp_root(repo_path: Path, temp_root: Path) -> None:
+    """检查仓库路径必须在 temp_root 目录树内。"""
     try:
         repo_path.relative_to(temp_root)
     except ValueError as error:

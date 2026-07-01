@@ -1,4 +1,10 @@
-"""Edit eval CLI runner."""
+"""Edit eval CLI runner。
+
+职责：解析运行参数、触发批量 edit eval、输出摘要与写入 JSON report。
+与 `eval_runner.run_edit_eval` 配合完成完整链路：
+- 评测语义与校验在 `eval_runner` 内；
+- 本文件聚焦 CLI 参数、报告路径、输出格式和运行入口。
+"""
 
 from __future__ import annotations
 
@@ -51,7 +57,11 @@ def write_eval_report(
     started_at: datetime,
     finished_at: datetime,
 ) -> Path:
-    """写入一次 edit eval 的 JSON 报告。"""
+    """写入一次 edit eval 的 JSON 报告。
+
+`result_data` 是主运行结果；report 文件只持久化汇总字段，
+供 CI 或历史归档读取。
+    """
 
     output_dir.mkdir(parents=True, exist_ok=True)
     report_payload = {
@@ -72,7 +82,13 @@ def write_eval_report(
 
 
 def print_summary(eval_payload: dict[str, object]) -> None:
-    """输出每条用例结果和总通过率。"""
+    """输出每条用例结果和总通过率。
+
+该输出为人类可读视图：
+- `[PASS] case_id` 或 `[FAIL] case_id: reason`；
+- 末尾输出 `pass rate: passed/total`。
+failure_type 在 fail 时会作为额外标签输出，便于快速定位。
+    """
 
     raw_results = eval_payload.get("results", [])
     if isinstance(raw_results, list):
@@ -85,7 +101,11 @@ def print_summary(eval_payload: dict[str, object]) -> None:
             else:
                 reasons = raw_result.get("reasons", [])
                 reason_text = _format_reasons(reasons)
-                print(f"[FAIL] {case_id}: {reason_text}")
+                failure_type = raw_result.get("failure_type")
+                if isinstance(failure_type, str) and failure_type.strip():
+                    print(f"[FAIL] {case_id}: {reason_text} (failure_type={failure_type})")
+                else:
+                    print(f"[FAIL] {case_id}: {reason_text}")
 
     passed = eval_payload.get("passed", 0)
     total = eval_payload.get("total", 0)
@@ -93,7 +113,15 @@ def print_summary(eval_payload: dict[str, object]) -> None:
 
 
 def main() -> int:
-    """运行 edit eval CLI。"""
+    """运行 edit eval CLI。
+
+工作流程：
+1. 解析 `--cases` / `--repo-root` / `--output-dir`；
+2. 如满足 bundled cases 且 repo 在本项目内，则注入确定性 LLM factory；
+3. 执行 `run_edit_eval`；
+4. 打印摘要并写入带时间戳的 report；
+5. 返回整体 pass/fail 状态码。
+    """
 
     args = parse_args()
     cases_path = Path(args.cases).expanduser().resolve()
@@ -138,7 +166,12 @@ def _format_reasons(raw_reasons: object) -> str:
 
 
 def _bundled_eval_llm_factory(cases_path: Path, repo_root: Path):
-    """仅为本仓库自带 eval cases 创建确定性 LLM factory。"""
+    """仅为本仓库自带 eval cases 创建确定性 LLM factory。
+
+确定性路径仅用于仓库内置 `edit_cases.json` 和 `context_cases.json`。
+目的是让这些用例在无外部 LLM 或 API 抖动时仍可稳定复现。
+自定义 cases 不走该分支，走标准 `LlmClient`。
+    """
 
     if repo_root.resolve() != PROJECT_ROOT.resolve():
         return None

@@ -1,24 +1,64 @@
-"""LLM + 工具调用循环，默认步数来自 MAX_STEPS。"""
+"""LLM + 工具调用核心循环（v0.6 PLAN→EXECUTE→VERIFY）。
+
+流程包含三段：
+- PLAN：基于仓库检查与问题生成受约束的 TaskPlan。
+- EXECUTE：按 plan_step_id 执行工具调用并记录上下文。
+- VERIFY：在 finish 后执行确定性校验并决定是否允许一次 repair。
+"""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from config import MAX_STEPS
 from context_stats import ContextStats
 from llm_client import LlmClient
 from logger import RunLogger
+from model_provider import TokenUsage
 import planner
 from prompts import build_system_prompt
 from run_state import RunState
 from schemas import TaskPlan, VerificationResult
 from tools import RepositoryTools, ToolError
+from usage_tracker import UsageCallRecord, summarize_usage_calls
 import verifier
 
 
 FULL_OBSERVATION_FEEDBACK_COUNT = 3
+PROMPT_VERSION = "v0.6"
+
+
+@dataclass(frozen=True)
+class _LlmCallResult:
+    """一次 LLM 调用的日志安全快照。
+
+该结构仅承载可序列化字段，不包含原始请求体，便于统一记录。
+"""
+
+    content: str
+    latency_ms: float | None = None
+    usage: dict[str, object] | None = None
+    provider: str | None = None
+    model: str | None = None
+    profile_name: str | None = None
+
+
+class _UsageTrackingLlmProxy:
+    """给 planner 使用的 chat-only 适配器。
+
+Planner 只调用 chat 方法，不关心 usage。真实统计仍由 CodeAnalysisAgent
+统一在 _call_llm 中更新。
+"""
+
+    def __init__(self, agent: CodeAnalysisAgent) -> None:
+        """注入主 Agent，作为 chat 返回值的统一来源。"""
+        self.agent = agent
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        """调用主 agent 的 LLM 接口并返回文本响应。"""
+        return self.agent._call_llm(messages).content
 
 
 class AgentStepError(ValueError):
@@ -26,7 +66,13 @@ class AgentStepError(ValueError):
 
 
 class CodeAnalysisAgent:
-    """最小本地代码库分析 agent。"""
+    """最小本地代码库分析 agent。
+
+主要职责：
+- 组织执行流程的阶段切换与日志更新。
+- 校验模型输出协议、执行工具调用与上下文统计。
+- 在 verify 阶段对结果进行最终判定，控制 pending approval 与 repair。
+"""
 
     def __init__(
         self,
@@ -44,11 +90,26 @@ class CodeAnalysisAgent:
         self.tool_runner = tool_runner or repository_tools.run_tool
         self.pending_approval_mode = pending_approval_mode
         self.context_stats = ContextStats()
+        self._usage_call_records: list[UsageCallRecord] = []
+        self._llm_call_count = 0
+        self._model_profile = self._initial_model_profile()
+        self._provider: str | None = None
+        self._model: str | None = None
 
     def answer(self, question: str) -> str:
-        """运行 agent 并返回最终答案。"""
+        """运行一次全量执行链路并返回最终可读答案。
+
+PLAN 阶段先生成计划，再按计划执行工具调用。执行阶段将所有工具输入/
+输出与统计落日志，支持失败恢复与重试。finish 后进入 VERIFY 阶段，做
+deterministic 校验与最终汇总。
+
+边界：
+- propose_patch 命中 pending approval 时立即返回待审视结果，不继续执行。
+- verify 仅在条件满足时允许一次 REPAIR（tests_failed 且 repair_attempts=0）。
+"""
 
         context_stats = ContextStats()
+        self._reset_usage_tracking()
         run_state = RunState()
         latest_test_result: VerificationResult | None = None
         patch_confirmed = False
@@ -67,6 +128,7 @@ class CodeAnalysisAgent:
         ]
 
         try:
+            # PLAN：先做仓库检查，避免 planner 依赖缺失上下文。
             inspect_repo_result = self._inspect_repo_safely()
             run_state = run_state.transition("PLAN")
             self._update_logger_state_payload(run_state, verify_status=None)
@@ -74,7 +136,7 @@ class CodeAnalysisAgent:
                 question,
                 inspect_repo_result,
                 self.max_steps,
-                self.llm_client,
+                _UsageTrackingLlmProxy(self),
             )
             run_state = run_state.with_plan(plan)
             self._update_logger_state_payload(run_state, verify_status=None)
@@ -88,6 +150,7 @@ class CodeAnalysisAgent:
 
             step_limit = min(self.max_steps, plan.max_steps)
             step_number = 1
+            # EXECUTE：循环执行计划步骤，未 finish 前可持续交互。
             while step_number <= step_limit:
                 messages_for_llm = self._messages_for_llm(messages, observation_summaries)
                 context_stats = replace(
@@ -95,7 +158,8 @@ class CodeAnalysisAgent:
                     messages_total_chars=self._messages_total_chars(messages_for_llm),
                 )
                 self.context_stats = context_stats
-                model_output = self.llm_client.chat(messages_for_llm)
+                llm_call_result = self._call_llm(messages_for_llm)
+                model_output = llm_call_result.content
                 messages.append({"role": "assistant", "content": model_output})
 
                 try:
@@ -115,6 +179,8 @@ class CodeAnalysisAgent:
                         model_output=model_output,
                         tool_call=None,
                         tool_result=tool_result,
+                        latency_ms=llm_call_result.latency_ms,
+                        usage=llm_call_result.usage,
                     )
                     messages.append(
                         {
@@ -172,9 +238,12 @@ class CodeAnalysisAgent:
                     model_output=model_output,
                     tool_call=tool_call,
                     tool_result=tool_result,
+                    latency_ms=llm_call_result.latency_ms,
+                    usage=llm_call_result.usage,
                 )
 
                 if pending_patch_to_return is not None:
+                    # pending approval：补丁已生成但尚未落盘应用，返回人工审查路径。
                     awaiting_state = run_state.transition("AWAITING_APPROVAL")
                     finished_state = awaiting_state.transition("FINISH")
                     verified_state, verify_status = self._verify_finished_run(
@@ -195,6 +264,7 @@ class CodeAnalysisAgent:
 
                 if tool_call["tool"] == "finish" and tool_result["ok"] is True:
                     final_answer = str(tool_result["output"])
+                    # VERIFY：模型 finish 后，不再执行工具调用，转入验证与结果汇总。
                     run_state = run_state.transition("VERIFY")
                     tests_result = self._build_stage_tests_result(
                         latest_test_result=latest_test_result,
@@ -275,13 +345,148 @@ class CodeAnalysisAgent:
         self.run_logger.set_final_answer(final_answer)
         return final_answer
 
+    def _reset_usage_tracking(self) -> None:
+        self._usage_call_records = []
+        self._llm_call_count = 0
+        self._model_profile = self._initial_model_profile()
+        self._provider = None
+        self._model = None
+        self._update_logger_usage_payload()
+
+    def _initial_model_profile(self) -> str | None:
+        """从日志 payload 或 llm_client 推断本次运行使用的 profile。"""
+        payload = getattr(self.run_logger, "payload", None)
+        if isinstance(payload, dict):
+            payload_profile = payload.get("model_profile")
+            if isinstance(payload_profile, str) and payload_profile.strip():
+                return payload_profile
+
+        client_profile = getattr(self.llm_client, "profile_name", None)
+        if isinstance(client_profile, str) and client_profile.strip():
+            return client_profile
+        return None
+
+    def _call_llm(self, messages: list[dict[str, str]]) -> _LlmCallResult:
+        """执行一次 LLM 调用并生成统一的调用快照。
+
+兼容 chat_response 与 legacy chat 两种实现，均返回含 content 的标准
+结构并统计 latency/usage/provider/model。
+"""
+        chat_response = getattr(self.llm_client, "chat_response", None)
+        if callable(chat_response):
+            response = chat_response(messages)
+            content = str(getattr(response, "content"))
+            latency_ms = self._optional_float(getattr(response, "latency_ms", None))
+            usage_value = getattr(response, "usage", None)
+            usage_dict = self._usage_to_dict(usage_value)
+            provider = self._optional_text(getattr(response, "provider", None))
+            model = self._optional_text(getattr(response, "model", None))
+            profile_name = self._optional_text(getattr(response, "profile_name", None))
+            self._record_llm_call(
+                latency_ms=latency_ms,
+                usage_value=usage_value,
+                provider=provider,
+                model=model,
+                profile_name=profile_name,
+            )
+            return _LlmCallResult(
+                content=content,
+                latency_ms=latency_ms,
+                usage=usage_dict,
+                provider=provider,
+                model=model,
+                profile_name=profile_name,
+            )
+
+        legacy_content = self.llm_client.chat(messages)
+        self._record_llm_call(
+            latency_ms=None,
+            usage_value=None,
+            provider=None,
+            model=None,
+            profile_name=None,
+        )
+        return _LlmCallResult(content=legacy_content)
+
+    def _record_llm_call(
+        self,
+        *,
+        latency_ms: float | None,
+        usage_value: object,
+        provider: str | None,
+        model: str | None,
+        profile_name: str | None,
+    ) -> None:
+        """记录 LLM 调用次数与 usage，用于后续 cost 与调用统计。"""
+        self._llm_call_count += 1
+        if profile_name is not None:
+            self._model_profile = profile_name
+        if provider is not None:
+            self._provider = provider
+        if model is not None:
+            self._model = model
+        if isinstance(usage_value, TokenUsage) and latency_ms is not None:
+            self._usage_call_records.append(
+                UsageCallRecord(latency_ms=latency_ms, usage=usage_value)
+            )
+        self._update_logger_usage_payload()
+
+    def _update_logger_usage_payload(self) -> None:
+        """将模型调用统计同步写入 logger payload。"""
+        usage_summary = summarize_usage_calls(self._usage_call_records).to_dict()
+        set_usage_summary = getattr(self.run_logger, "set_usage_summary", None)
+        if callable(set_usage_summary):
+            set_usage_summary(
+                model_profile=self._model_profile,
+                provider=self._provider,
+                model=self._model,
+                prompt_version=PROMPT_VERSION,
+                llm_calls=self._llm_call_count,
+                usage_summary=usage_summary,
+            )
+            return
+
+        payload = getattr(self.run_logger, "payload", None)
+        if isinstance(payload, dict):
+            payload["model_profile"] = self._model_profile
+            payload["provider"] = self._provider
+            payload["model"] = self._model
+            payload["prompt_version"] = PROMPT_VERSION
+            payload["llm_calls"] = self._llm_call_count
+            payload["usage_summary"] = usage_summary
+            save = getattr(self.run_logger, "save", None)
+            if callable(save):
+                save()
+
+    def _usage_to_dict(self, usage_value: object) -> dict[str, object] | None:
+        to_dict = getattr(usage_value, "to_dict", None)
+        if callable(to_dict):
+            usage_dict = to_dict()
+            if isinstance(usage_dict, dict):
+                return dict(usage_dict)
+        return None
+
+    def _optional_float(self, value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _optional_text(self, value: object) -> str | None:
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
     def _inspect_repo_safely(self) -> dict[str, object]:
+        """执行仓库检查，失败时返回结构化错误而非抛异常。"""
         try:
             return self.repository_tools.inspect_repo()
         except (OSError, ToolError) as error:
             return {"ok": False, "error": str(error)}
 
     def _parse_model_output(self, model_output: str) -> dict[str, object]:
+        """解析并校验模型输出，要求思路 + 工具名 + args/plan_step_id 协议。"""
         try:
             parsed_output = json.loads(model_output.strip())
         except json.JSONDecodeError as error:
@@ -319,6 +524,7 @@ class CodeAnalysisAgent:
         tool_call: dict[str, object],
         run_state: RunState,
     ) -> str | None:
+        """确保 plan_step_id 来源于当前 plan，避免跳步或空步骤执行。"""
         raw_plan_step_id = tool_call.get("plan_step_id")
         if not isinstance(raw_plan_step_id, str) or not raw_plan_step_id.strip():
             return "plan_step_id 必须是计划中存在的非空字符串"
@@ -333,6 +539,7 @@ class CodeAnalysisAgent:
         return None
 
     def _format_execute_stage_instructions(self, plan: TaskPlan) -> str:
+        """把可执行计划序列化为执行提示，固定 plan_step_id 白名单。"""
         plan_dict = plan.to_dict()
         valid_step_ids = []
         if isinstance(plan_dict, dict):
@@ -355,6 +562,7 @@ class CodeAnalysisAgent:
         tool_call: dict[str, object],
         propose_patch_succeeded: bool,
     ) -> str | None:
+        """限制 apply_patch 前提，确保会话内先走 propose_patch。"""
         if tool_call.get("tool") == "apply_patch" and not propose_patch_succeeded:
             return "apply_patch 必须在同一次执行中成功调用 propose_patch 之后才能执行"
         return None
@@ -365,6 +573,7 @@ class CodeAnalysisAgent:
         run_state: RunState,
         user_task: str,
     ) -> dict[str, object]:
+        """将 tool_call 标准化后执行工具，统一将 ToolError 转换为失败结果。"""
         prepared_tool_call = self._prepare_tool_call(tool_call, run_state, user_task)
         tool_call.clear()
         tool_call.update(prepared_tool_call)
@@ -381,6 +590,7 @@ class CodeAnalysisAgent:
         run_state: RunState,
         user_task: str,
     ) -> dict[str, object]:
+        """为 propose_patch 注入审批可追踪元信息，不影响其他工具参数。"""
         if tool_call.get("tool") != "propose_patch":
             return dict(tool_call)
 
@@ -445,6 +655,7 @@ class CodeAnalysisAgent:
         tool_call: dict[str, object],
         tool_result: dict[str, object],
     ) -> VerificationResult | None:
+        """将 run_tests 工具输出转换为 VerificationResult。"""
         if tool_call.get("tool") != "run_tests" or tool_result.get("ok") is not True:
             return None
         tool_output = tool_result.get("output")
@@ -476,6 +687,7 @@ class CodeAnalysisAgent:
         latest_test_result: VerificationResult | None,
         run_state: RunState,
     ) -> VerificationResult:
+        """缺失 run_tests 时给出缺省判定，保证 VERIFY 可继续收敛。"""
         if latest_test_result is not None:
             return latest_test_result
         plan = run_state.plan
@@ -525,6 +737,7 @@ class CodeAnalysisAgent:
         patch_confirmed: bool,
         pending_patch: dict[str, object] | None = None,
     ) -> tuple[RunState, VerificationResult]:
+        """完成状态快照后，调用 verifier 的确定性验证流程。"""
         state_with_tests = run_state.with_context_stats(context_stats.to_dict())
         verify_status = verifier.verify_run_state(
             state_with_tests,
@@ -613,6 +826,7 @@ class CodeAnalysisAgent:
         verify_status: VerificationResult,
         run_state: RunState,
     ) -> bool:
+        """仅 edit/refactor 且 tests_failed 且第一次失败时允许一次 repair。"""
         plan = run_state.plan
         return (
             plan is not None
@@ -623,6 +837,7 @@ class CodeAnalysisAgent:
         )
 
     def _format_verify_feedback(self, verify_status: VerificationResult) -> str:
+        """失败时输出可继续执行 repair 的模型提示文本。"""
         return (
             "VERIFY 失败且仅由 tests_failed 导致，允许一次 REPAIR。\n"
             f"验证结果:\n{json.dumps(verify_status.to_dict(), ensure_ascii=False, indent=2)}\n"
@@ -700,6 +915,7 @@ class CodeAnalysisAgent:
         tool_result: dict[str, object],
         serialized_result: str,
     ) -> ContextStats:
+        """更新 step、消息、文件读取与搜索调用统计，用于后续预算评估。"""
         steps_used = context_stats.steps_used + 1
         total_tool_output_chars = (
             context_stats.total_tool_output_chars + len(serialized_result)
@@ -776,6 +992,7 @@ class CodeAnalysisAgent:
         messages: list[dict[str, str]],
         observation_summaries: list[dict[str, object]],
     ) -> list[dict[str, str]]:
+        """压缩早期观测为摘要片段，减少重复上下文噪音。"""
         compact_message_indexes = {
             message_index
             for summary in observation_summaries[:-FULL_OBSERVATION_FEEDBACK_COUNT]
@@ -797,10 +1014,15 @@ class CodeAnalysisAgent:
         return messages_for_llm
 
     def _summary_message_index(self, summary: dict[str, object]) -> int:
+        """将 observation summary 映射为消息下标，异常类型用于早露。
+
+该异常不视作程序错误，是上游 summary 数据结构损坏的防线。
+"""
         message_index = summary["message_index"]
         if not isinstance(message_index, int) or isinstance(message_index, bool):
             raise RuntimeError("observation summary message_index 必须是整数")
         return message_index
 
     def _messages_total_chars(self, messages: list[dict[str, str]]) -> int:
+        """粗粒度累计本轮消息长度，用于上下文预算统计。"""
         return sum(len(message["role"]) + len(message["content"]) for message in messages)

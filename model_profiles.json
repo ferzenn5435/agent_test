@@ -1,0 +1,35 @@
+{
+  "default": {
+    "provider": "openai_compatible",
+    "base_url_env": "LLM_BASE_URL",
+    "api_key_env": "LLM_API_KEY",
+    "model_env": "LLM_MODEL",
+    "temperature": 0.0,
+    "max_output_tokens": 4096,
+    "timeout_seconds": 60,
+    "retry_count": 2,
+    "pricing": null
+  },
+  "fast": {
+    "provider": "openai_compatible",
+    "base_url_env": "FAST_LLM_BASE_URL",
+    "api_key_env": "FAST_LLM_API_KEY",
+    "model_env": "FAST_LLM_MODEL",
+    "temperature": 0.0,
+    "max_output_tokens": 2048,
+    "timeout_seconds": 30,
+    "retry_count": 1,
+    "pricing": null
+  },
+  "strong": {
+    "provider": "openai_compatible",
+    "base_url_env": "STRONG_LLM_BASE_URL",
+    "api_key_env": "STRONG_LLM_API_KEY",
+    "model_env": "STRONG_LLM_MODEL",
+    "temperature": 0.0,
+    "max_output_tokens": 8192,
+    "timeout_seconds": 90,
+    "retry_count": 2,
+    "pricing": null
+  }
+}

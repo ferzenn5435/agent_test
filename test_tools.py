@@ -226,10 +226,12 @@ class TestRepoIndexV05(unittest.TestCase):
         self.temp_repo_helper.cleanup()
 
     def _read_index(self, index_path: str) -> dict[str, object]:
+        """辅助方法：读取索引 JSON 文件。"""
         full_index_path = self.temp_repo_helper.repo_root / index_path
         return json.loads(full_index_path.read_text(encoding="utf-8"))
 
     def _file_records_by_path(self, repo_index: dict[str, object]) -> dict[str, dict[str, object]]:
+        """将索引文件列表转换为 path -> record 字典。"""
         files = repo_index["files"]
         self.assertIsInstance(files, list)
         if not isinstance(files, list):
@@ -621,6 +623,7 @@ class RepositoryToolsTest(unittest.TestCase):
         patch_result: dict[str, object],
         expected_error_text: str,
     ) -> None:
+        """断言 patch_result.errors 列表包含预期的错误文本。"""
         errors_object = patch_result["errors"]
         self.assertIsInstance(errors_object, list)
         if not isinstance(errors_object, list):
@@ -685,6 +688,7 @@ class TestRunTestsTool(unittest.TestCase):
         self.temp_repo_helper.cleanup()
 
     def _latest_run_events(self) -> list[dict[str, object]]:
+        """返回最近一次运行的事件日志列表。"""
         run_events = self.temp_repo_helper.repo_root / ".repopilot/runs"
         run_files = list(run_events.glob("*.jsonl"))
         if not run_files:
@@ -1077,7 +1081,7 @@ class TestProposePatchV03(unittest.TestCase):
 
 
 class TestApplyPatchV03(unittest.TestCase):
-    """Verify v0.3 saved patch application, backup, rejection, and rollback."""
+    """验证 v0.3 保存补丁的应用、备份、拒绝和回滚行为。"""
 
     def setUp(self) -> None:
         self.temp_repo_helper = V03TempRepoHelper()
@@ -1087,6 +1091,7 @@ class TestApplyPatchV03(unittest.TestCase):
         self.temp_repo_helper.cleanup()
 
     def _propose_patch(self, diff_text: str, instruction: str = "apply patch") -> str:
+        """辅助方法：提交补丁提案并返回 patch_id。"""
         patch_result = self.repository_tools.propose_patch(
             instruction=instruction,
             diff=diff_text,
@@ -1095,10 +1100,12 @@ class TestApplyPatchV03(unittest.TestCase):
         return str(patch_result["patch_id"])
 
     def _metadata(self, patch_id: str) -> dict[str, object]:
+        """辅助方法：读取指定补丁的 metadata.json。"""
         metadata_path = self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "metadata.json"
         return json.loads(metadata_path.read_text(encoding="utf-8"))
 
     def _run_events(self, patch_id: str) -> list[dict[str, object]]:
+        """辅助方法：读取指定补丁的运行事件日志。"""
         run_path = self.temp_repo_helper.repo_root / ".repopilot/runs" / f"{patch_id}.jsonl"
         return [
             json.loads(line)

@@ -22,6 +22,7 @@ from config import MAX_STEPS
 from llm_client import LlmClient
 from logger import RunLogger
 from main import main as cli_main
+from model_provider import LLMResponse, TokenUsage
 from tools import RepositoryTools
 
 eval_runner = importlib.import_module("eval_runner")
@@ -33,6 +34,7 @@ EvalSafetyError = eval_safety.EvalSafetyError
 MustContainRule = eval_runner.MustContainRule
 check_allowed_changed_files = eval_runner.check_allowed_changed_files
 check_must_contain = eval_runner.check_must_contain
+classify_failure_type = eval_runner.classify_failure_type
 compare_snapshots = eval_runner.compare_snapshots
 copy_fixture_to_temp = eval_runner.copy_fixture_to_temp
 load_edit_cases = eval_runner.load_edit_cases
@@ -73,7 +75,30 @@ class FakeLlmClient:
         return output
 
 
+class StructuredFakeLlmClient(FakeLlmClient):
+    """返回 LLMResponse 的 fake LLM，用于验证 usage schema。"""
+
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
+        content = self.chat(messages)
+        return LLMResponse(
+            content=content,
+            provider="mock",
+            model="mock-model",
+            profile_name="mock-profile",
+            latency_ms=12.5,
+            usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+                estimated=False,
+                estimated_cost=0.25,
+            ),
+            raw={},
+        )
+
+
 def _default_plan_outputs() -> list[str]:
+    """返回默认 plan 阶段输出列表（单个 TaskPlan JSON）。"""
     return [_task_plan_json()]
 
 
@@ -84,6 +109,7 @@ def _task_plan_json(
     requires_tests: bool = False,
     expected_changed_files: Sequence[str] = (),
 ) -> str:
+    """构造 TaskPlan JSON 字符串，用于 fake LLM 的 plan 阶段返回。"""
     verification: list[dict[str, object]] = []
     if task_type in {"edit", "refactor"}:
         verification = [{"must_contain": [{"path": "README.md", "strings": ["# 简单 Python 项目"]}]}]
@@ -103,6 +129,7 @@ def _task_plan_json(
 
 
 def _tool_call(tool: str, args: dict[str, object], plan_step_id: str | None = "step-1") -> str:
+    """构造 agent 步骤的工具调用 JSON 字符串。"""
     tool_call: dict[str, object] = {
         "thought": f"调用 {tool}",
         "tool": tool,
@@ -114,6 +141,7 @@ def _tool_call(tool: str, args: dict[str, object], plan_step_id: str | None = "s
 
 
 def _unified_diff(path: str, before: str, after: str) -> str:
+    """生成 unified diff 格式字符串，用于构造补丁测试数据。"""
     diff_lines = difflib.unified_diff(
         before.splitlines(),
         after.splitlines(),
@@ -125,6 +153,7 @@ def _unified_diff(path: str, before: str, after: str) -> str:
 
 
 def _apply_last_patch_call(messages: list[dict[str, str]]) -> str:
+    """从最近一次 LLM 响应中提取 patch_id，构造 apply_patch 调用的回调函数。"""
     latest_feedback = messages[-1]["content"]
     patch_id_match = re.search(r'"patch_id"\s*:\s*"([^"]+)"', latest_feedback)
     if patch_id_match is None:
@@ -133,10 +162,12 @@ def _apply_last_patch_call(messages: list[dict[str, str]]) -> str:
 
 
 def _run_compile_tests_call() -> str:
+    """返回执行 compile 测试的工具调用 JSON。"""
     return _tool_call("run_tests", {"command_name": "compile"})
 
 
 def _readme_patch_call() -> str:
+    """返回更新 README.md 的 propose_patch 工具调用 JSON。"""
     before = (
         "# 简单 Python 项目\n"
         "\n"
@@ -153,6 +184,7 @@ def _readme_patch_call() -> str:
 
 
 def _app_patch_call() -> str:
+    """返回修改 app.py 返回值的 propose_patch 工具调用 JSON。"""
     before = "def add(a, b):\n    return a + b\n"
     after = "def add(a, b):\n    return 42\n"
     return _tool_call(
@@ -165,6 +197,7 @@ def _app_patch_call() -> str:
 
 
 def _new_file_patch_call(path: str, content: str) -> str:
+    """返回新增文件的 propose_patch 工具调用 JSON。"""
     diff_lines = [
         f"diff --git a/{path} b/{path}",
         "--- /dev/null",
@@ -255,6 +288,7 @@ class TestFakeLlmClient(unittest.TestCase):
         self.assertEqual((), eval_result.changed_files)
         self.assertIn("agent 未在 max_steps 内成功调用 finish", eval_result.reasons)
         self.assertIsNotNone(eval_result.error)
+        self.assertEqual("invalid_json", eval_result.failure_type)
 
     def test_eval_prompt_documents_auto_approval_without_changing_case_prompt(self) -> None:
         eval_case = self._case("fake-auto-approval")
@@ -730,6 +764,26 @@ class TestEditEvalRunner(unittest.TestCase):
         self.assertTrue(eval_result.final_answer.startswith("README.md 已更新。"), eval_result.final_answer)
         self.assertIn("v0.6 summary:", eval_result.final_answer)
         self.assertIsNone(eval_result.error)
+        self.assertIsNone(eval_result.failure_type)
+
+    def test_run_edit_case_records_model_usage_fields_from_run_log(self) -> None:
+        case = self._case(case_id="usage-fields")
+        fake_llm = StructuredFakeLlmClient(
+            [_tool_call("finish", {"answer": "无需修改。"})]
+        )
+
+        eval_result = run_edit_case(case, self.project_root, lambda _case: fake_llm)
+
+        self.assertTrue(eval_result.passed, eval_result.reasons)
+        self.assertEqual("mock-profile", eval_result.model_profile)
+        self.assertEqual("mock", eval_result.provider)
+        self.assertEqual("mock-model", eval_result.model)
+        self.assertEqual(2, eval_result.llm_call_count)
+        self.assertEqual(25.0, eval_result.total_latency_ms)
+        self.assertEqual(30, eval_result.total_tokens)
+        self.assertEqual(0, eval_result.estimated_tokens)
+        self.assertEqual(0.5, eval_result.estimated_cost)
+        self.assertIsNone(eval_result.failure_type)
 
     def test_run_edit_case_fails_unauthorized_changed_file(self) -> None:
         case = self._case(
@@ -750,6 +804,7 @@ class TestEditEvalRunner(unittest.TestCase):
         self.assertFalse(eval_result.passed)
         self.assertEqual(("app.py",), eval_result.changed_files)
         self.assertIn("未授权的变更文件: app.py", eval_result.reasons)
+        self.assertEqual("tool_policy_violation", eval_result.failure_type)
 
     def test_run_edit_case_fails_unauthorized_added_file(self) -> None:
         case = self._case(
@@ -802,6 +857,7 @@ class TestEditEvalRunner(unittest.TestCase):
         self.assertEqual(1, eval_result.steps)
         self.assertIsNotNone(eval_result.error)
         self.assertIn("agent 未在 max_steps 内成功调用 finish", eval_result.reasons)
+        self.assertEqual("max_steps_exceeded", eval_result.failure_type)
 
     def test_run_edit_case_records_changed_files_when_llm_raises_after_patch(self) -> None:
         case = self._case(
@@ -986,6 +1042,7 @@ class TestEditEvalRunner(unittest.TestCase):
             self.assertEqual("new line\n", (apply_repo / "sample.txt").read_text(encoding="utf-8"))
 
     def _snapshot_log_dir(self, log_dir: Path) -> tuple[tuple[str, int, int], ...]:
+        """记录日志目录的快照状态，用于验证 eval 不污染真实日志。"""
         if not log_dir.exists():
             return ()
         snapshots: list[tuple[str, int, int]] = []
@@ -1003,11 +1060,13 @@ class TestEditEvalRunner(unittest.TestCase):
         return tuple(sorted(snapshots))
 
     def _create_pending_eval_repo(self, repo_path: Path) -> Path:
+        """创建包含 sample.txt 的临时评估仓库。"""
         repo_path.mkdir()
         (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")
         return repo_path
 
     def _generate_pending_patch(self, repo_path: Path) -> str:
+        """使用 fake LLM 驱动 agent 生成待审批补丁。"""
         diff_text = _unified_diff("sample.txt", "old line\n", "new line\n")
         fake_llm = FakeLlmClient(
             [
@@ -1049,12 +1108,14 @@ class TestEditEvalRunner(unittest.TestCase):
         return patch_id_line.removeprefix("patch_id: ")
 
     def _assert_pending_patch_metadata(self, repo_path: Path, patch_id: str) -> None:
+        """验证待审批补丁的 metadata 字段。"""
         metadata = self._read_patch_metadata(repo_path, patch_id)
         self.assertEqual(patch_id, metadata["patch_id"])
         self.assertEqual("pending_approval", metadata["status"])
         self.assertEqual(["sample.txt"], metadata["paths"])
 
     def _read_patch_metadata(self, repo_path: Path, patch_id: str) -> dict[str, object]:
+        """读取补丁 metadata.json 文件。"""
         metadata_path = repo_path / ".repopilot" / "patches" / patch_id / "metadata.json"
         self.assertTrue(metadata_path.is_file(), metadata_path)
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1067,6 +1128,7 @@ class TestEditEvalRunner(unittest.TestCase):
         repo_path: Path,
         patch_id: str,
     ) -> tuple[int, dict[str, object]]:
+        """以指定子命令运行 main.py patch CLI 并解析 JSON 输出。"""
         stdout = io.StringIO()
         argv = ["main.py", "patch", patch_command, "--repo", str(repo_path), patch_id]
         with patch.object(sys, "argv", argv), redirect_stdout(stdout):
@@ -1113,6 +1175,7 @@ class TestEvalRunnerV06LogChecks(unittest.TestCase):
         include_plan: bool = True,
         include_apply_patch: bool = True,
     ) -> dict[str, object]:
+        """构造用于 v0.6 log 约束检查的 payload 字典。"""
         steps: list[dict[str, object]] = []
         if include_apply_patch:
             steps.append(
@@ -1264,6 +1327,58 @@ class TestEvalRunnerV06LogChecks(unittest.TestCase):
         )
 
         self.assertEqual(["max_repair_attempts 违规: limit=0, actual=1"], errors)
+
+
+class TestEvalFailureClassification(unittest.TestCase):
+    """验证 edit/context/stage eval 复用的失败分类。"""
+
+    def test_success_has_no_failure_type(self) -> None:
+        self.assertIsNone(
+            classify_failure_type(
+                passed=True,
+                reasons=(),
+                error=None,
+                test_results=None,
+            )
+        )
+
+    def test_classifies_known_failure_reasons(self) -> None:
+        cases = [
+            ("invalid_json", ("case 执行异常: 模型输出不是严格 JSON 对象",), None, None),
+            ("provider_error", ("case 执行异常: LLM HTTP 错误 500",), "LLM HTTP 错误 500", None),
+            ("timeout", ("case 执行异常: LLM 网络或超时错误: timed out",), "timed out", None),
+            ("phase_policy_violation", ("required_stages 违规: missing=VERIFY",), None, None),
+            ("phase_policy_violation", ("require_verify_after_patch 违规: 成功 apply_patch 后 stage_history 缺少 VERIFY",), None, None),
+            ("max_steps_exceeded", ("agent 未在 max_steps 内成功调用 finish",), None, None),
+            ("test_failed", ("test_command unit 退出码非 0: 1",), None, {"exit_code": 1, "timed_out": False}),
+            ("verification_failed", ("case 执行异常: VERIFY 失败: tests_failed",), "VERIFY 失败: tests_failed", None),
+            ("patch_not_applied", ("must_contain 缺少文本: README.md -> marker",), None, None),
+            ("patch_invalid", ("case 执行异常: patch 格式错误",), "patch 格式错误", None),
+            ("tool_policy_violation", ("未授权的变更文件: app.py",), None, None),
+            ("unknown", ("无法归类的失败",), None, None),
+        ]
+        for expected_failure_type, reasons, error, test_results in cases:
+            with self.subTest(expected_failure_type=expected_failure_type, reasons=reasons):
+                self.assertEqual(
+                    expected_failure_type,
+                    classify_failure_type(
+                        passed=False,
+                        reasons=reasons,
+                        error=error,
+                        test_results=test_results,
+                    ),
+                )
+
+    def test_classifies_timed_out_test_as_timeout_before_test_failed(self) -> None:
+        self.assertEqual(
+            "timeout",
+            classify_failure_type(
+                passed=False,
+                reasons=("test_command unit 执行超时", "test_command unit 退出码非 0: 1"),
+                error=None,
+                test_results={"exit_code": 1, "timed_out": True},
+            ),
+        )
 
 
 class TestContextEvalV05(unittest.TestCase):
@@ -1503,6 +1618,7 @@ class TestRunEditEvalCli(unittest.TestCase):
                     "final_answer": None,
                     "error": "failed",
                     "test_results": None,
+                    "failure_type": "patch_not_applied",
                 },
             ],
         }
@@ -1532,6 +1648,7 @@ class TestRunEditEvalCli(unittest.TestCase):
         output_text = stdout.getvalue()
         self.assertIn("[PASS] passing-case", output_text)
         self.assertIn("[FAIL] failing-case: 缺少必要文本", output_text)
+        self.assertIn("failure_type=patch_not_applied", output_text)
         self.assertIn("pass rate: 1/2", output_text)
         self.assertNotIn("done", output_text)
 

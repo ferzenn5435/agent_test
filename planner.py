@@ -1,4 +1,9 @@
-# planner.py - strict JSON task plan generator
+"""Planner：PLAN 阶段严格生成与校验 `TaskPlan` JSON。
+
+本文件承接执行协议中的 `PLAN` 阶段：只负责把 LLM 的自然语言输出
+转成可验证的结构化计划，不在此阶段执行业务改动。计划字段与约束一旦
+通过校验，执行器才能进入 `EXECUTE` 并使用这些 `plan_step_id` 驱动工具调用。
+"""
 
 from __future__ import annotations
 
@@ -19,14 +24,22 @@ from schemas import (
 
 
 class LlmClientProtocol(Protocol):
-    """Structural protocol: an object with chat(messages) -> str."""
+    """约定外部 LLM 客户端的最小接口。
+
+`Planner` 不依赖具体厂商实现，只要求 `chat(messages)` 返回纯文本即可；
+后续是否是 JSON、是否满足字段约束，由本文件自身完成，不可把“模型能力”当作
+信任边界。
+    """
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         ...
 
 
 class PlannerError(ValueError):
-    """Task plan generation or validation failed."""
+    """Plan 构建/校验失败的专用错误。
+
+该异常一旦抛出，PLAN 阶段直接失败，不能进入 `EXECUTE`。
+"""
 
 
 def build_planner_prompt(
@@ -34,7 +47,15 @@ def build_planner_prompt(
     inspect_repo_result: dict[str, object],
     max_steps: int,
 ) -> str:
-    """Build prompt asking the model for strict TaskPlan JSON."""
+    """构建用于计划生成的系统提示。
+
+返回字符串要求模型只输出严格的 `TaskPlan` JSON，原因如下：
+
+- 统一 `TaskPlan` 结构让执行层能逐步关联 `plan_step_id` 与真实 `run_state`。
+- 约束 `max_steps`、`requires_patch`、`requires_tests`、`verification`
+  等字段，保证执行与验证条件在计划层就被约束。
+- 禁止 markdown、额外说明，避免 LLM 在边界外输出导致解析失败。
+"""
 
     return (
         f"User task: {user_task}\n\n"
@@ -63,7 +84,12 @@ def build_planner_prompt(
 
 
 def _validate_llm_output(raw_output: str) -> dict[str, object]:
-    """Parse and validate that model output is a strict JSON object."""
+    """把模型输出从文本解析为 JSON 并执行第一道协议校验。
+
+这里是 `PLAN` 阶段的关键入口：只接受非空、无 code fence 的文本，且必须可
+解析为 JSON object（禁止数组/标量）。该步骤失败会直接拒绝执行，防止后续
+工具循环在弱格式输入上继续运行。
+"""
 
     stripped_output = raw_output.strip()
 
@@ -86,7 +112,12 @@ def _validate_llm_output(raw_output: str) -> dict[str, object]:
 
 
 def _parse_plan_steps(raw_steps: object) -> tuple[PlanStep, ...]:
-    """Parse steps from a raw JSON list."""
+    """解析并校验计划步骤列表。
+
+返回的 `PlanStep` 顺序即执行顺序基线。这里仅做字段形状校验：每个步骤
+必须有非空 `id` 与 `title`，因为后续 `model` 在 `EXECUTE` 阶段必须回填同
+名 `plan_step_id`；空、重复或缺失会让执行链路失去追踪锚点。
+"""
     if not isinstance(raw_steps, list):
         raise PlannerError("steps must be a list")
     if not raw_steps:
@@ -117,7 +148,11 @@ def _parse_plan_steps(raw_steps: object) -> tuple[PlanStep, ...]:
 
 
 def _parse_must_contain_rules(raw_rules: object) -> tuple[MustContainRule, ...]:
-    """Parse must_contain rules from a raw JSON list."""
+    """解析 `verification` 中的 `must_contain` 约束。
+
+`must_contain` 用于 VERIFY 期望的证据文本检查。这里要求 `path` 与 `strings`
+结构完整，以便后续 verifier 可以对结果文件执行“内容存在性”判断。
+"""
     if isinstance(raw_rules, dict):
         raw_rules = [raw_rules]
     if not isinstance(raw_rules, list):
@@ -152,7 +187,11 @@ def _parse_must_contain_rules(raw_rules: object) -> tuple[MustContainRule, ...]:
 
 
 def _parse_verification_specs(raw_verification: object) -> tuple[VerificationSpec, ...]:
-    """Parse verification specs from a raw JSON list."""
+    """解析 `verification` 规范列表。
+
+每个 spec 支持仅有的 `must_contain` 字段；解析时将其转为标准对象，后续
+由 `verify_run_state` 按规范统一聚合并验证。
+"""
     if not isinstance(raw_verification, list):
         raise PlannerError("verification must be a list")
 
@@ -172,7 +211,11 @@ def _parse_verification_specs(raw_verification: object) -> tuple[VerificationSpe
 
 
 def _parse_expected_changed_files(raw_value: object) -> tuple[str, ...]:
-    """Parse expected_changed_files from a raw JSON value."""
+    """解析计划中预期变更文件清单。
+
+该字段作为 verifier 的白名单约束基础，任何未落在列表内的实际变更都将被
+`VERIFY` 拒绝，避免工具链无界改动。
+"""
     if raw_value is None:
         return ()
 
@@ -191,7 +234,17 @@ def _parse_expected_changed_files(raw_value: object) -> tuple[str, ...]:
 
 
 def _build_task_plan_from_dict(parsed: dict[str, object], max_steps: int) -> TaskPlan:
-    """Convert a parsed dict into a validated TaskPlan dataclass."""
+    """将 dict 映射转换为 `TaskPlan`，并触发跨字段语义校验。
+
+字段校验采用两层：
+
+1. 本函数做结构性与范围性检查（枚举值、类型、数量上界）。
+2. 最终构造 `TaskPlan` 时由 `__post_init__` 完成跨字段语义检查
+   （如任务类型、PATCH/测试要求与步数关系）。
+
+两层校验形成 “parse-time + schema-time” 防线，保证后续 `EXECUTE/VERIFY` 有
+稳定前置条件。
+"""
 
     # --- task_type ---
     raw_task_type = parsed.get("task_type")
@@ -258,7 +311,15 @@ def create_plan(
     max_steps: int,
     llm_client: LlmClientProtocol,
 ) -> TaskPlan:
-    """Use an LLM to generate and validate a task plan."""
+    """通过 LLM 产出并校验任务计划。
+
+返回的 `TaskPlan` 一旦构造成功，等价于 PLAN 阶段通过：
+- 执行器可以依据 `steps` 组织 `plan_step_id`。
+- Verifier 可直接复用该计划中的 `expected_changed_files` 与 `verification`
+  作为 `VERIFY` 约束。
+- 若模型只自称完成计划、未满足 JSON 协议，本函数抛错，`execute` 流程不会开
+  始，防止“自我声明”进入系统。
+"""
 
     prompt = build_planner_prompt(
         user_task=user_task,

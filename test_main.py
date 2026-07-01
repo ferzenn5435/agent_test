@@ -16,9 +16,10 @@ from unittest.mock import patch
 from config import MAX_STEPS
 from agent import CodeAnalysisAgent
 from eval_safety import write_eval_temp_marker
-from llm_client import LlmClient
+from llm_client import LlmClient, LlmClientError
 from logger import RunLogger
 from main import CliApplyPatchApproval, main, parse_args
+from model_provider import LLMResponse, TokenUsage
 from prompts import build_system_prompt
 from run_state import RunState
 from tools import RepositoryTools, ToolError
@@ -79,6 +80,48 @@ class FakeLlmClient:
         return output
 
 
+class FakeUsageLlmClient:
+    """返回结构化 LLMResponse 的 fake client。"""
+
+    def __init__(
+        self,
+        outputs: Sequence[LLMResponse],
+        prepend_plan: bool = True,
+    ) -> None:
+        self.prepend_plan = prepend_plan
+        self.outputs: list[LLMResponse] = []
+        if prepend_plan:
+            self.outputs.append(
+                _llm_response(
+                    content=_task_plan_json(),
+                    latency_ms=10.0,
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                    total_tokens=3,
+                )
+            )
+        self.outputs.extend(outputs)
+        self.messages_by_call: list[list[dict[str, str]]] = []
+        self._call_count = 0
+        self.profile_name = "usage-profile"
+
+    @property
+    def call_count(self) -> int:
+        plan_overhead = 1 if self.prepend_plan else 0
+        return max(0, self._call_count - plan_overhead)
+
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
+        self.messages_by_call.append([dict(message) for message in messages])
+        if self._call_count >= len(self.outputs):
+            raise AssertionError("fake LLM 没有更多结构化输出")
+        response = self.outputs[self._call_count]
+        self._call_count += 1
+        return response
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        return self.chat_response(messages).content
+
+
 class FakeRunLogger:
     """记录 agent 写入 logger 的原始步骤。"""
 
@@ -87,6 +130,8 @@ class FakeRunLogger:
         self.final_answer: str | None = None
         self.error: str | None = None
         self.context_stats: dict[str, object] | None = None
+        self.usage_summary: dict[str, object] | None = None
+        self.llm_calls: int | None = None
 
     def record_step(
         self,
@@ -94,6 +139,8 @@ class FakeRunLogger:
         model_output: str,
         tool_call: dict[str, object] | None,
         tool_result: dict[str, object],
+        latency_ms: float | None = None,
+        usage: dict[str, object] | None = None,
     ) -> None:
         self.steps.append(
             {
@@ -101,6 +148,8 @@ class FakeRunLogger:
                 "model_output": model_output,
                 "tool_call": tool_call,
                 "tool_result": tool_result,
+                "latency_ms": latency_ms,
+                "usage": usage,
             }
         )
 
@@ -113,8 +162,22 @@ class FakeRunLogger:
     def set_context_stats(self, stats: dict[str, object]) -> None:
         self.context_stats = dict(stats)
 
+    def set_usage_summary(
+        self,
+        *,
+        model_profile: str | None,
+        provider: str | None,
+        model: str | None,
+        prompt_version: str | None,
+        llm_calls: int,
+        usage_summary: dict[str, object],
+    ) -> None:
+        self.llm_calls = llm_calls
+        self.usage_summary = dict(usage_summary)
+
 
 def _default_plan_outputs() -> list[str]:
+    """返回默认 plan 阶段输出（单个 TaskPlan JSON），用于 fake LLM 的 prepend。"""
     return [_task_plan_json()]
 
 
@@ -125,6 +188,7 @@ def _task_plan_json(
     requires_tests: bool = False,
     expected_changed_files: Sequence[str] = (),
 ) -> str:
+    """构造 TaskPlan JSON 字符串，用于 fake LLM 的 plan 阶段返回。"""
     verification: list[dict[str, object]] = []
     if task_type in {"edit", "refactor"}:
         verification = [{"must_contain": [{"path": "sample.py", "strings": ["ok"]}]}]
@@ -143,11 +207,38 @@ def _task_plan_json(
     )
 
 
+def _llm_response(
+    content: str,
+    latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    raw: dict[str, object] | None = None,
+) -> LLMResponse:
+    """构造 LLMResponse 实例，用于 FakeUsageLlmClient 的结构化返回。"""
+    return LLMResponse(
+        content=content,
+        provider="mock-provider",
+        model="usage-model",
+        profile_name="usage-profile",
+        latency_ms=latency_ms,
+        usage=TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated=False,
+            estimated_cost=0.001,
+        ),
+        raw=raw or {},
+    )
+
+
 def _agent_tool_call(
     tool: str,
     args: dict[str, object],
     plan_step_id: str | None = "step-1",
 ) -> str:
+    """构造 agent 工具调用 JSON 字符串，用于 fake LLM 的输出模拟。"""
     tool_call: dict[str, object] = {
         "thought": f"调用 {tool}",
         "tool": tool,
@@ -159,6 +250,7 @@ def _agent_tool_call(
 
 
 def _assert_v06_summary(test_case: unittest.TestCase, final_answer: str, prefix: str) -> None:
+    """断言最终答案包含 v0.6 summary 的所有必要字段。"""
     test_case.assertTrue(final_answer.startswith(prefix), final_answer)
     for expected_text in [
         "v0.6 summary:",
@@ -180,6 +272,14 @@ class MainParserTest(unittest.TestCase):
         self.assertEqual(".", args.repo_path)
         self.assertEqual("question", args.question)
         self.assertEqual(MAX_STEPS, args.max_steps)
+        self.assertEqual("default", args.model_profile)
+
+    def test_parse_args_accepts_explicit_model_profile_with_repo_option(self) -> None:
+        args = parse_args(["--repo", ".", "--model-profile", "fast", "question"])
+
+        self.assertEqual(".", args.repo_path)
+        self.assertEqual("question", args.question)
+        self.assertEqual("fast", args.model_profile)
 
     def test_parse_args_accepts_explicit_max_steps_with_repo_option(self) -> None:
         args = parse_args(["--repo", ".", "--max-steps", "3", "question"])
@@ -194,6 +294,7 @@ class MainParserTest(unittest.TestCase):
         self.assertEqual(".", args.repo_path)
         self.assertEqual("question", args.question)
         self.assertEqual(5, args.max_steps)
+        self.assertEqual("default", args.model_profile)
 
     def test_parse_args_rejects_invalid_max_steps(self) -> None:
         for raw_value in ["0", "-1", "abc"]:
@@ -340,11 +441,13 @@ class TestPatchCliCommands(unittest.TestCase):
         with patch("sys.argv", argv):
             with patch("main.CodeAnalysisAgent") as mocked_agent:
                 with patch("main.load_llm_config_from_env") as mocked_load_config:
-                    with patch("builtins.input") as mocked_input:
-                        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                            exit_code = main()
+                    with patch("main.LlmClient") as mocked_llm_client:
+                        with patch("builtins.input") as mocked_input:
+                            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                                exit_code = main()
         mocked_agent.assert_not_called()
         mocked_load_config.assert_not_called()
+        mocked_llm_client.assert_not_called()
         mocked_input.assert_not_called()
         return exit_code, stdout_buffer.getvalue(), stderr_buffer.getvalue()
 
@@ -829,6 +932,58 @@ class TestMainApplyApproval(unittest.TestCase):
         approval_gate = agent_kwargs["tool_runner"].__self__
         self.assertIsInstance(approval_gate, CliApplyPatchApproval)
         self.assertEqual("manual_pending", approval_gate.approval_mode)
+
+    def test_ordinary_cli_passes_default_model_profile_to_llm_client(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            with patch("sys.argv", ["main.py", "--repo", str(repo_path), "question"]):
+                with patch("main.load_llm_config_from_env") as mocked_load_config:
+                    with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
+                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                            mocked_agent_class.return_value.answer.return_value = "done"
+                            with redirect_stdout(io.StringIO()):
+                                exit_code = main()
+
+        self.assertEqual(0, exit_code)
+        mocked_load_config.assert_not_called()
+        mocked_llm_client.assert_called_once_with(model_profile="default")
+
+    def test_ordinary_cli_passes_explicit_model_profile_to_llm_client(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            argv = ["main.py", "--repo", str(repo_path), "--model-profile", "fast", "question"]
+            with patch("sys.argv", argv):
+                with patch("main.load_llm_config_from_env") as mocked_load_config:
+                    with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
+                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                            mocked_agent_class.return_value.answer.return_value = "done"
+                            with redirect_stdout(io.StringIO()):
+                                exit_code = main()
+
+        self.assertEqual(0, exit_code)
+        mocked_load_config.assert_not_called()
+        mocked_llm_client.assert_called_once_with(model_profile="fast")
+
+    def test_unknown_model_profile_returns_nonzero_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            stderr_buffer = io.StringIO()
+            argv = ["main.py", "--repo", str(repo_path), "--model-profile", "missing", "question"]
+            with patch("sys.argv", argv):
+                with patch("main.load_llm_config_from_env") as mocked_load_config:
+                    with patch(
+                        "main.LlmClient",
+                        side_effect=LlmClientError("Unknown model profile: missing"),
+                    ) as mocked_llm_client:
+                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                            with redirect_stderr(stderr_buffer):
+                                exit_code = main()
+
+        self.assertNotEqual(0, exit_code)
+        mocked_load_config.assert_not_called()
+        mocked_llm_client.assert_called_once_with(model_profile="missing")
+        mocked_agent_class.assert_not_called()
+        self.assertIn("Unknown model profile: missing", stderr_buffer.getvalue())
 
     def _create_saved_patch(self, repo_path: Path) -> tuple[RepositoryTools, str]:
         (repo_path / "sample.txt").write_text("old line\n", encoding="utf-8")
@@ -1373,6 +1528,112 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertEqual(0, run_logger.payload["repair_attempt"])
             self.assertEqual(0, run_logger.payload["repair_attempts"])
 
+    def test_payload_records_run_and_step_usage_from_structured_llm_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "sample.py").write_text("print('ok')\n", encoding="utf-8")
+            secret_value = "sk-test-secret-value"
+            fake_llm = FakeUsageLlmClient(
+                [
+                    _llm_response(
+                        content=_agent_tool_call("read_file", {"path": "sample.py"}),
+                        latency_ms=20.0,
+                        prompt_tokens=4,
+                        completion_tokens=5,
+                        total_tokens=9,
+                        raw={"Authorization": f"Bearer {secret_value}"},
+                    ),
+                    _llm_response(
+                        content=_agent_tool_call("finish", {"answer": "完成"}),
+                        latency_ms=30.0,
+                        prompt_tokens=6,
+                        completion_tokens=7,
+                        total_tokens=13,
+                        raw={"api_key_echo": secret_value},
+                    ),
+                ]
+            )
+            run_logger = RunLogger(repo_path=repo_path, user_task="usage", log_dir=repo_path / "logs")
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=2,
+            )
+
+            final_answer = agent.answer("读取后完成")
+
+            _assert_v06_summary(self, final_answer, "完成")
+            self.assertEqual("usage-profile", run_logger.payload["model_profile"])
+            self.assertEqual("mock-provider", run_logger.payload["provider"])
+            self.assertEqual("usage-model", run_logger.payload["model"])
+            self.assertEqual("v0.6", run_logger.payload["prompt_version"])
+            self.assertEqual(3, run_logger.payload["llm_calls"])
+            usage_summary = cast(dict[str, object], run_logger.payload["usage_summary"])
+            self.assertEqual(3, usage_summary["llm_call_count"])
+            self.assertEqual(60.0, usage_summary["total_latency_ms"])
+            self.assertEqual(11, usage_summary["prompt_tokens"])
+            self.assertEqual(14, usage_summary["completion_tokens"])
+            self.assertEqual(25, usage_summary["total_tokens"])
+
+            steps = cast(list[dict[str, object]], run_logger.payload["steps"])
+            self.assertEqual(2, len(steps))
+            self.assertEqual(20.0, steps[0]["latency_ms"])
+            self.assertEqual(
+                {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 5,
+                    "total_tokens": 9,
+                    "estimated": False,
+                    "estimated_cost": 0.001,
+                },
+                steps[0]["usage"],
+            )
+            self.assertEqual(30.0, steps[1]["latency_ms"])
+            self.assertNotIn("raw", steps[0])
+            metadata_text = json.dumps(
+                {
+                    "model_profile": run_logger.payload["model_profile"],
+                    "provider": run_logger.payload["provider"],
+                    "model": run_logger.payload["model"],
+                    "prompt_version": run_logger.payload["prompt_version"],
+                    "llm_calls": run_logger.payload["llm_calls"],
+                    "usage_summary": run_logger.payload["usage_summary"],
+                    "steps_usage": [
+                        {
+                            "latency_ms": step.get("latency_ms"),
+                            "usage": step.get("usage"),
+                        }
+                        for step in steps
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            self.assertNotIn("Authorization", metadata_text)
+            self.assertNotIn(secret_value, metadata_text)
+
+    def test_legacy_chat_fake_keeps_running_with_safe_usage_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            fake_llm = FakeLlmClient([_agent_tool_call("finish", {"answer": "完成"})])
+            run_logger = RunLogger(repo_path=repo_path, user_task="legacy", log_dir=repo_path / "logs")
+            agent = CodeAnalysisAgent(
+                llm_client=cast(LlmClient, fake_llm),
+                repository_tools=RepositoryTools(repo_path),
+                run_logger=run_logger,
+                max_steps=1,
+            )
+
+            final_answer = agent.answer("直接完成")
+
+            _assert_v06_summary(self, final_answer, "完成")
+            self.assertEqual(2, run_logger.payload["llm_calls"])
+            usage_summary = cast(dict[str, object], run_logger.payload["usage_summary"])
+            self.assertEqual(0, usage_summary["llm_call_count"])
+            steps = cast(list[dict[str, object]], run_logger.payload["steps"])
+            self.assertIsNone(steps[0]["latency_ms"])
+            self.assertIsNone(steps[0]["usage"])
+
     def test_tests_failed_verification_triggers_one_repair_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
@@ -1566,6 +1827,23 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
             self.assertEqual(0, run_logger.payload["repair_attempt"])
             self.assertEqual(0, run_logger.payload["repair_attempts"])
             self.assertIsNone(run_logger.payload["verify_status"])
+            self.assertIsNone(run_logger.payload["model_profile"])
+            self.assertIsNone(run_logger.payload["provider"])
+            self.assertIsNone(run_logger.payload["model"])
+            self.assertEqual("v0.6", run_logger.payload["prompt_version"])
+            self.assertEqual(0, run_logger.payload["llm_calls"])
+            self.assertEqual(
+                {
+                    "llm_call_count": 0,
+                    "total_latency_ms": 0.0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_tokens": 0,
+                    "estimated_cost": None,
+                },
+                run_logger.payload["usage_summary"],
+            )
 
     def test_record_step_keeps_old_shape_and_copies_plan_step_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1583,6 +1861,14 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
                 model_output=json.dumps(tool_call, ensure_ascii=False),
                 tool_call=tool_call,
                 tool_result={"ok": True, "output": "ok"},
+                latency_ms=12.5,
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "estimated": False,
+                    "estimated_cost": 0.01,
+                },
             )
 
             steps = cast(list[dict[str, object]], run_logger.payload["steps"])
@@ -1593,6 +1879,47 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
                     self.assertIn(old_step_field, step_payload)
             self.assertEqual("step-1", step_payload["plan_step_id"])
             self.assertEqual("step-1", run_logger.payload["plan_step_id"])
+            self.assertEqual(12.5, step_payload["latency_ms"])
+            self.assertEqual(
+                {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "estimated": False,
+                    "estimated_cost": 0.01,
+                },
+                step_payload["usage"],
+            )
+
+    def test_set_usage_summary_consumes_agent_supplied_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            run_logger = RunLogger(repo_path=repo_path, user_task="usage", log_dir=repo_path / "logs")
+            usage_summary = {
+                "llm_call_count": 2,
+                "total_latency_ms": 42.0,
+                "prompt_tokens": 11,
+                "completion_tokens": 12,
+                "total_tokens": 23,
+                "estimated_tokens": 0,
+                "estimated_cost": 0.02,
+            }
+
+            run_logger.set_usage_summary(
+                model_profile="fast",
+                provider="mock-provider",
+                model="mock-model",
+                prompt_version="v0.6",
+                llm_calls=2,
+                usage_summary=usage_summary,
+            )
+
+            self.assertEqual("fast", run_logger.payload["model_profile"])
+            self.assertEqual("mock-provider", run_logger.payload["provider"])
+            self.assertEqual("mock-model", run_logger.payload["model"])
+            self.assertEqual("v0.6", run_logger.payload["prompt_version"])
+            self.assertEqual(2, run_logger.payload["llm_calls"])
+            self.assertEqual(usage_summary, run_logger.payload["usage_summary"])
 
 
 if __name__ == "__main__":
