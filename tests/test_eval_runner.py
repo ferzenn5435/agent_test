@@ -218,7 +218,7 @@ class TestFakeLlmClient(unittest.TestCase):
     """验证 deterministic fake LLM 可驱动真实 agent 循环。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
 
     def _case(self, case_id: str, max_steps: int = 5) -> EditEvalCase:
         return EditEvalCase(
@@ -308,7 +308,7 @@ class TestEditCaseLoader(unittest.TestCase):
     """验证 edit 评测用例加载与校验规则。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
 
     def _write_cases(self, cases: list[dict[str, object]]) -> Path:
         temp_directory = tempfile.TemporaryDirectory()
@@ -547,7 +547,7 @@ class TestEvalTempSafety(unittest.TestCase):
     """验证 eval 临时代码库 marker 与文件变更校验。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
         self.temp_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_directory.cleanup)
         self.temp_root = Path(self.temp_directory.name)
@@ -702,7 +702,7 @@ class TestEditEvalRunner(unittest.TestCase):
     """验证 edit eval runner 核心执行流程。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
 
     def _case(
         self,
@@ -1142,7 +1142,7 @@ class TestEvalRunnerV06LogChecks(unittest.TestCase):
     """验证 v0.6 计划、阶段、验证和修复次数检查。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
 
     def _case(
         self,
@@ -1385,7 +1385,7 @@ class TestContextEvalV05(unittest.TestCase):
     """验证 v0.5 context 约束会进入 edit eval 判定。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
 
     def _case(
         self,
@@ -1585,7 +1585,7 @@ class TestRunEditEvalCli(unittest.TestCase):
     """验证 edit eval CLI 摘要输出与结果持久化。"""
 
     def setUp(self) -> None:
-        self.project_root = Path(__file__).resolve().parent
+        self.project_root = Path(__file__).resolve().parents[1]
         self.temp_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_directory.cleanup)
         self.temp_root = Path(self.temp_directory.name)
@@ -1778,7 +1778,7 @@ class TestReadmeV04Docs(unittest.TestCase):
     """验证 README 记录 v0.4 edit eval 的用途、运行方式和安全边界。"""
 
     def setUp(self) -> None:
-        project_root = Path(__file__).resolve().parent
+        project_root = Path(__file__).resolve().parents[1]
         self.readme_text = (project_root / "README.md").read_text(encoding="utf-8")
 
     def test_documents_v04_edit_eval_purpose_and_command(self) -> None:
@@ -1848,7 +1848,7 @@ class TestReadmeV05Docs(unittest.TestCase):
     """验证 README 记录 v0.5 上下文管理、项目索引和边界约束。"""
 
     def setUp(self) -> None:
-        project_root = Path(__file__).resolve().parent
+        project_root = Path(__file__).resolve().parents[1]
         self.readme_text = (project_root / "README.md").read_text(encoding="utf-8")
 
     def test_documents_v05_section_and_index_tools(self) -> None:

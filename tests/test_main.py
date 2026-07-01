@@ -553,7 +553,7 @@ class TestReadmeDocumentation(unittest.TestCase):
     """验证 README 保留关键版本说明。"""
 
     def setUp(self) -> None:
-        readme_path = Path(__file__).resolve().with_name("README.md")
+        readme_path = Path(__file__).resolve().parents[1] / "README.md"
         self.readme_text = readme_path.read_text(encoding="utf-8")
 
     def test_v06_plan_execute_verify_section_documents_protocol(self) -> None:
@@ -1037,7 +1037,7 @@ class TestReadmeV03Docs(unittest.TestCase):
     """验证 README 和 eval 用例描述 v0.3 安全修改流程。"""
 
     def setUp(self) -> None:
-        project_root = Path(__file__).resolve().parent
+        project_root = Path(__file__).resolve().parents[1]
         self.readme_text = (project_root / "README.md").read_text(encoding="utf-8")
         self.eval_text = (project_root / "eval_case.json").read_text(encoding="utf-8")
 

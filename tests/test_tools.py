@@ -549,7 +549,7 @@ class V03TempRepoHelper:
 class TestV03TempRepoHelper(unittest.TestCase):
     """验证 v0.3 测试 helper 不污染真实项目根目录。"""
 
-    real_repo_root = Path(__file__).resolve().parent
+    real_repo_root = Path(__file__).resolve().parents[1]
     root_artifact_names = (
         ".repopilot",
         ".env",
@@ -605,7 +605,7 @@ class RepositoryToolsTest(unittest.TestCase):
     """验证只读代码库工具的基础行为和安全限制。"""
 
     def setUp(self) -> None:
-        self.repo_root = Path(__file__).resolve().parent
+        self.repo_root = Path(__file__).resolve().parents[1]
         self.repository_tools = RepositoryTools(self.repo_root)
         self.env_file = self.repo_root / ".env"
         self.created_env_file = False

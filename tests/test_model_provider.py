@@ -5,8 +5,12 @@ from __future__ import annotations
 import ast
 import json
 import unittest
+from pathlib import Path
 
 from model_provider import LLMResponse, ModelProvider, TokenUsage
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class EchoProvider:
@@ -113,7 +117,7 @@ class TestModelProviderProtocol(unittest.TestCase):
         self.assertEqual("fast", response.profile_name)
 
     def test_module_does_not_import_env_http_or_concrete_providers(self) -> None:
-        with open("model_provider.py", encoding="utf-8") as source_file:
+        with (REPO_ROOT / "model_provider.py").open(encoding="utf-8") as source_file:
             module_ast = ast.parse(source_file.read())
 
         imported_modules: set[str] = set()

@@ -323,13 +323,13 @@ class BundledEvalLlmClient:
             case=case,
             read_calls=[
                 _tool_call("read_file", {"path": "app.py"}),
-                _tool_call("read_file", {"path": "test_app.py"}),
+                _tool_call("read_file", {"path": "tests/test_app.py"}),
             ],
             instruction="新增 subtract 函数和 unittest 覆盖。",
             diff=_unified_diff("app.py", before_app, after_app)
-            + _unified_diff("test_app.py", before_test, after_test),
+            + _unified_diff("tests/test_app.py", before_test, after_test),
             test_command="unit",
-            answer="app.py 和 test_app.py 已新增 subtract 覆盖。",
+            answer="app.py 和 tests/test_app.py 已新增 subtract 覆盖。",
         )
 
     def _planned_add_function_outputs(self, case) -> list[str]:
@@ -370,13 +370,13 @@ class BundledEvalLlmClient:
             case=case,
             read_calls=[
                 _tool_call("read_file", {"path": "app.py"}),
-                _tool_call("read_file", {"path": "test_app.py"}),
+                _tool_call("read_file", {"path": "tests/test_app.py"}),
             ],
             instruction="按计划新增 multiply 函数和 unittest 覆盖。",
             diff=_unified_diff("app.py", before_app, after_app)
-            + _unified_diff("test_app.py", before_test, after_test),
+            + _unified_diff("tests/test_app.py", before_test, after_test),
             test_command="unit",
-            answer="app.py 和 test_app.py 已新增 multiply 覆盖。",
+            answer="app.py 和 tests/test_app.py 已新增 multiply 覆盖。",
         )
 
     def _forbidden_outside_outputs(self, case) -> list[str]:

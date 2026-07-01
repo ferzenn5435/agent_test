@@ -5,10 +5,14 @@ from __future__ import annotations
 import ast
 import json
 import unittest
+from pathlib import Path
 
 from config import ModelPricing
 from model_provider import TokenUsage
 from usage_tracker import UsageCallRecord, normalize_call_usage, summarize_usage_calls
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DuckPricing:
@@ -151,7 +155,7 @@ class TestUsageSummary(unittest.TestCase):
         self.assertIsNone(summary.to_dict()["estimated_cost"])
 
     def test_module_does_not_import_side_effect_dependencies(self) -> None:
-        with open("usage_tracker.py", encoding="utf-8") as source_file:
+        with (REPO_ROOT / "usage_tracker.py").open(encoding="utf-8") as source_file:
             module_ast = ast.parse(source_file.read())
 
         imported_modules: set[str] = set()
