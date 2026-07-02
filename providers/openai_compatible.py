@@ -39,21 +39,15 @@ class OpenAICompatibleProvider:
         self.profile = profile
         self.endpoint = self._normalize_endpoint(profile.base_url)
 
-    def call(
-        self,
-        messages: Sequence[dict[str, str]],
-        profile_name: str,
-    ) -> LLMResponse:
+    def call(self, messages: Sequence[dict[str, str]]) -> LLMResponse:
         """发送聊天消息并返回结构化响应。
 
-`profile_name` 参数保留用于接口兼容，当前请求体以对象 profile 为准。
 若调用成功：
 - 解析响应 JSON
 - 抽取第一条 choice 的 content
 - 合并并规范化 usage（优先供应商返回）
 """
 
-        del profile_name
         request_body = {
             "model": self.profile.model,
             "messages": list(messages),

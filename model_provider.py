@@ -84,10 +84,6 @@ class ModelProvider(Protocol):
 - 返回 `LLMResponse`；遇到错误可抛异常，由上层统一重抛。
 """
 
-    def call(
-        self,
-        messages: Sequence[dict[str, str]],
-        profile_name: str,
-    ) -> LLMResponse:
+    def call(self, messages: Sequence[dict[str, str]]) -> LLMResponse:
         """发送聊天消息并返回结构化响应。"""
         ...

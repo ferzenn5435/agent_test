@@ -42,11 +42,7 @@ class MockProvider:
         self.latency_ms = latency_ms
         self.simulate = simulate
 
-    def call(
-        self,
-        messages: Sequence[dict[str, str]],
-        profile_name: str,
-    ) -> LLMResponse:
+    def call(self, messages: Sequence[dict[str, str]]) -> LLMResponse:
         """返回配置好的 mock 响应或模拟错误。
 
 模拟开关：
@@ -55,7 +51,7 @@ class MockProvider:
 - `invalid_json` -> 返回非法 JSON 文本内容，配合上层解析路径做回归。
         """
 
-        del messages, profile_name
+        del messages
         if self.simulate == "provider_error":
             raise RuntimeError("mock provider_error")
         if self.simulate == "timeout":

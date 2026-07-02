@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from agent import CodeAnalysisAgent
-from config import ConfigError, MAX_STEPS, load_llm_config_from_env
+from config import ConfigError, MAX_STEPS
 from llm_client import LlmClient, LlmClientError
 from logger import RunLogger
 from tools import RepositoryTools, ToolError
@@ -55,8 +55,8 @@ def _positive_int(raw_value: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析 answer 主流程参数。
 
-解析策略保持向后兼容：既支持 `python main.py <repo> <question>` 的位置参数，
-也支持 `--repo` 显式参数。
+    解析策略保留两种公开入口形式：既支持 `python main.py <repo> <question>`
+    的位置参数，也支持 `--repo` 显式参数。
 
 返回值统一归一化为一个 `Namespace`，下游只读取:
 - command
@@ -198,7 +198,7 @@ def _run_patch_command(args: argparse.Namespace) -> int:
         elif args.patch_command == "show":
             output = repository_tools.show_patch(args.patch_id, full=args.full)
         elif args.patch_command == "apply":
-            output = repository_tools.apply_pending_patch(args.patch_id)
+            output = repository_tools.apply_patch(args.patch_id)
         elif args.patch_command == "reject":
             output = repository_tools.reject_patch(args.patch_id)
         else:
@@ -212,6 +212,7 @@ def _run_patch_command(args: argparse.Namespace) -> int:
         print(f"patch command failed: {_patch_error_text(output)}", file=sys.stderr)
         return 1
 
+    # patch 子命令输出稳定 JSON，便于脚本和测试读取；错误路径只写 stderr，避免混入 JSON。
     _write_json_output(output)
     return 0
 
@@ -256,6 +257,8 @@ class CliApplyPatchApproval:
         if self.approval_mode == "auto_for_eval":
             return self._run_auto_for_eval_apply(tool_call, patch_id)
         if self.approval_mode == "manual_pending":
+            # 普通 answer 流程默认停在 pending_approval：模型可以提出补丁，
+            # 但真实仓库的写入必须由用户后续显式运行 patch apply 完成。
             return self._manual_pending_apply_result(patch_info)
 
         self._print_confirmation_prompt(patch_info)
@@ -334,8 +337,8 @@ class CliApplyPatchApproval:
 - 不一致时拒绝返回，防止越权修改非预期文件集合。
         """
         self.repository_tools._validate_patch_id(patch_id)
-        patch_text = self.repository_tools._read_patch_file(patch_id)
-        metadata = self.repository_tools._read_patch_metadata(patch_id)
+        patch_text = self.repository_tools._read_new_patch_file(patch_id)
+        metadata = self.repository_tools._read_new_patch_metadata(patch_id)
         validated_paths = self.repository_tools.validate_unified_diff(patch_text)
         metadata_paths = metadata.get("paths")
         if not isinstance(metadata_paths, list) or not all(
@@ -351,7 +354,7 @@ class CliApplyPatchApproval:
         ):
             warnings = []
 
-        patch_path = self.repository_tools._get_patch_file_path(patch_id)
+        patch_path = self.repository_tools._get_new_patch_file_path(patch_id)
         target_files = metadata.get("target_files")
         if not isinstance(target_files, list):
             target_files = []
@@ -402,7 +405,6 @@ class CliApplyPatchApproval:
             details=details,
         )
 
-
 def main() -> int:
     """运行命令行程序。
 
@@ -432,6 +434,7 @@ def main() -> int:
         run_logger.payload["model_profile"] = model_profile
         run_logger.save()
         llm_client = LlmClient(model_profile=model_profile)
+        # 主交互流程只允许生成待审批补丁；确定性 apply 独立放在 `python main.py patch apply`。
         approval_gate = CliApplyPatchApproval(
             repository_tools,
             approval_mode="manual_pending",

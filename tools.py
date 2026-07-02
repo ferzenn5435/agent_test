@@ -558,6 +558,8 @@ class RepositoryTools:
         lines = diff_text.splitlines()
         line_index = 0
         while line_index < len(lines):
+            # 每个文件段都必须从 `diff --git a/... b/...` 开始；这样后续 ---/+++
+            # 与 hunk 校验都能绑定到同一个目标路径，避免“头部指向 A、内容修改 B”的补丁。
             current_line = lines[line_index]
             self._reject_unsupported_diff_line(current_line)
             diff_header_match = DIFF_GIT_HEADER_PATTERN.match(current_line)
@@ -621,6 +623,8 @@ class RepositoryTools:
                 actual_old_count = 0
                 actual_new_count = 0
 
+                # hunk body 的 old/new 计数是补丁可信度的第一道内容校验：
+                # 只接受上下文、删除、新增和 “\ No newline” 标记，拒绝任何未定义行类型。
                 while line_index < len(lines):
                     body_line = lines[line_index]
                     self._reject_unsupported_diff_line(body_line)
@@ -731,11 +735,6 @@ class RepositoryTools:
         response["ok"] = True
         return response
 
-    def apply_pending_patch(self, patch_id: str) -> dict[str, object]:
-        """兼容旧入口，实际委托确定性的 pending-approval 应用路径。"""
-    
-        return self.apply_patch(patch_id)
-
     def apply_patch(self, patch_id: str) -> dict[str, object]:
         """应用待审批补丁。
 
@@ -756,6 +755,8 @@ class RepositoryTools:
         }
 
         try:
+            # 写文件前集中完成全部“可提前判断”的校验：ID、状态、diff hash、
+            # 目标路径集合和当前文件 hash。任何一项失败都保持业务文件零改动。
             self._validate_patch_id(patch_id)
             metadata = self._read_new_patch_metadata(patch_id)
             self._validate_apply_metadata(patch_id, metadata)
@@ -805,6 +806,7 @@ class RepositoryTools:
                 if verification_result.get("status") == "failed"
             ]
             if failed_verifications:
+                # 验证失败视为 apply 整体失败：即使文件已经写入，也必须回滚到写入前状态。
                 raise ToolError("patch verification failed")
         except (OSError, ToolError) as error:
             rollback_result = self._rollback_patch_apply(patch_id, written_existing_files, written_new_files)
@@ -901,6 +903,8 @@ class RepositoryTools:
             target_path = self._validate_diff_target_path(target_path_text, must_exist=False)
 
             if operation == "modify":
+                # modify 必须命中“创建补丁时看到的同一个文件版本”；hash 不一致说明用户
+                # 或其他进程已改过目标文件，继续写入会覆盖未知变更。
                 if existed_before is not True:
                     raise ToolError(f"metadata target state mismatch: {target_path_text} modify must have existed_before=true")
                 if not isinstance(sha256_before, str) or not sha256_before:
@@ -911,6 +915,7 @@ class RepositoryTools:
                 if current_sha256 != sha256_before:
                     raise ToolError(f"metadata target state mismatch: {target_path_text} sha256_before does not match current file")
             elif operation == "create":
+                # create 只允许目标完全不存在，避免把“新增文件补丁”变成覆盖已有文件。
                 if existed_before is not False:
                     raise ToolError(f"metadata target state mismatch: {target_path_text} create must have existed_before=false")
                 if sha256_before is not None:
@@ -929,6 +934,7 @@ class RepositoryTools:
     def _run_apply_verification(self, metadata: dict[str, object]) -> list[dict[str, object]]:
         command_names = self._extract_plan_test_command_names(metadata.get("plan_snapshot"))
         if not command_names:
+            # 没有随补丁保存测试计划时显式记录 skipped，避免调用方把“无验证”误读成通过。
             return [{"command_name": None, "status": "skipped", "reason": "no test_commands"}]
 
         verification_results: list[dict[str, object]] = []
@@ -997,6 +1003,8 @@ class RepositoryTools:
         line_index = 0
         patched_files: list[dict[str, object]] = []
         while line_index < len(diff_lines):
+            # 这里不再只做格式校验，而是按 hunk 游标真正重建目标文件内容；
+            # 后续写盘只使用该重建结果，确保 apply 与 validate 使用同一套路径/内容规则。
             diff_header_match = DIFF_GIT_HEADER_PATTERN.match(diff_lines[line_index])
             if diff_header_match is None:
                 raise ToolError(f"diff missing valid file header: line {line_index + 1}")
@@ -1046,12 +1054,15 @@ class RepositoryTools:
                     marker = body_line[:1]
                     body_text = body_line[1:]
                     if marker == " ":
+                        # 上下文行必须逐字匹配当前文件；这比只相信 hunk 行号更安全，
+                        # 能阻止过期补丁在相同行号但不同内容上被误应用。
                         self._assert_hunk_source_line(original_lines, source_cursor, body_text, new_file_path)
                         patched_lines.append(body_text)
                         source_cursor += 1
                         removed_count += 1
                         added_count += 1
                     elif marker == "-":
+                        # 删除行也必须逐字匹配，确保删除的是补丁作者实际看到的文本。
                         self._assert_hunk_source_line(original_lines, source_cursor, body_text, new_file_path)
                         source_cursor += 1
                         removed_count += 1
@@ -1127,6 +1138,7 @@ class RepositoryTools:
         rollback_errors: list[str] = []
         rollback_files: list[dict[str, object]] = []
         backup_dir = self.repopilot_backups_dir / patch_id
+        # 先恢复原有文件，再删除新增文件：这样即使删除新增文件失败，原有业务文件也已尽量复原。
         for target_path in existing_files:
             backup_path = backup_dir / target_path.relative_to(self.repo_root)
             try:
@@ -1141,6 +1153,7 @@ class RepositoryTools:
                 rollback_files.append(
                     {"path": self._format_repo_path(target_path), "action": "restore", "ok": False, "error": error_message}
                 )
+        # 新建文件按写入逆序删除，便于随后从叶子到根清理空目录。
         for target_path in reversed(new_files):
             try:
                 if target_path.exists():
@@ -1196,6 +1209,7 @@ class RepositoryTools:
         command = command_map[normalized_command_name]
         run_id = self._generate_patch_id(f"run_tests:{normalized_command_name}")
 
+        # 每次测试运行也写入 runs 事件日志，便于把补丁应用、验证和回滚证据串起来。
         self._append_run_event(
             patch_id=run_id,
             event_type="run_tests_start",
@@ -1460,7 +1474,7 @@ class RepositoryTools:
         return patch_path
 
     def _read_patch_file(self, patch_id: str) -> str:
-        patch_path = self._get_patch_file_path(patch_id)
+        patch_path = self._get_new_patch_file_path(patch_id)
         if not patch_path.is_file():
             raise ToolError(f"patch 文件不存在: {patch_id}")
 
@@ -1486,7 +1500,7 @@ class RepositoryTools:
         return metadata_path
 
     def _read_patch_metadata(self, patch_id: str) -> dict[str, object]:
-        metadata_path = self._get_patch_metadata_path(patch_id)
+        metadata_path = self._get_new_patch_metadata_path(patch_id)
         if not metadata_path.is_file():
             raise ToolError(f"metadata 文件不存在: {patch_id}")
 
@@ -1517,7 +1531,7 @@ class RepositoryTools:
         if not isinstance(status, str) or not status.strip():
             raise ToolError("status 必须是非空字符串")
 
-        metadata = self._read_patch_metadata(patch_id)
+        metadata = self._read_new_patch_metadata(patch_id)
         metadata["status"] = status
         metadata["updated_at"] = datetime.now().astimezone().isoformat()
         self._write_patch_metadata(metadata)
@@ -1550,20 +1564,6 @@ class RepositoryTools:
             run_file.write(json.dumps(event, ensure_ascii=False) + "\n")
         return run_path
 
-    def _get_patch_file_path(self, patch_id: str) -> Path:
-        self._validate_patch_id(patch_id)
-        new_patch_path = self._get_new_patch_file_path(patch_id)
-        if new_patch_path.exists():
-            return new_patch_path
-        return self.repopilot_patches_dir / f"{patch_id}.patch"
-
-    def _get_patch_metadata_path(self, patch_id: str) -> Path:
-        self._validate_patch_id(patch_id)
-        new_metadata_path = self._get_new_patch_metadata_path(patch_id)
-        if new_metadata_path.exists():
-            return new_metadata_path
-        return self.repopilot_patches_dir / f"{patch_id}.json"
-
     def _get_new_patch_file_path(self, patch_id: str) -> Path:
         self._validate_patch_id(patch_id)
         return self.repopilot_patches_dir / patch_id / "patch.diff"
@@ -1577,12 +1577,6 @@ class RepositoryTools:
         patch_dir = self.repopilot_patches_dir / patch_id
         if patch_dir.exists():
             shutil.rmtree(patch_dir)
-        for legacy_path in (
-            self.repopilot_patches_dir / f"{patch_id}.patch",
-            self.repopilot_patches_dir / f"{patch_id}.json",
-        ):
-            if legacy_path.exists():
-                legacy_path.unlink()
 
     def _build_patch_target_files(self, touched_paths: list[str]) -> list[dict[str, object]]:
         """生成目标文件快照列表。

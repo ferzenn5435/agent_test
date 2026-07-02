@@ -17,6 +17,7 @@ from planner import (
     create_plan,
     LlmClientProtocol,
 )
+from model_provider import LLMResponse, TokenUsage
 from schemas import (
     MustContainRule,
     PlanStep,
@@ -93,13 +94,21 @@ class FakeLlmClient:
         self.call_count = 0
         self.messages_by_call: list[list[dict[str, str]]] = []
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
         self.messages_by_call.append([dict(m) for m in messages])
         if self.call_count >= len(self.outputs):
             raise AssertionError("fake LLM has no more outputs")
         output = self.outputs[self.call_count]
         self.call_count += 1
-        return output
+        return LLMResponse(
+            content=output,
+            provider="mock",
+            model="planner-model",
+            profile_name="planner-profile",
+            latency_ms=0.0,
+            usage=TokenUsage(),
+            raw={},
+        )
 
 
 class TestBuildPlannerPrompt(unittest.TestCase):
@@ -524,7 +533,7 @@ class TestCreatePlanWithFakeLlm(unittest.TestCase):
         class BrokenLlmClient:
             """A broken client that raises."""
 
-            def chat(self, messages: list[dict[str, str]]) -> str:
+            def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
                 raise RuntimeError("network error")
 
         with self.assertRaisesRegex(PlannerError, "LLM call failed"):

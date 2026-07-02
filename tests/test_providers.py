@@ -72,7 +72,6 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
             with patch("providers.openai_compatible.perf_counter", side_effect=[1.0, 1.25]):
                 llm_response = OpenAICompatibleProvider(self.profile).call(
                     self.messages,
-                    profile_name="ignored-profile-name",
                 )
 
         self.assertEqual("pong", llm_response.content)
@@ -105,7 +104,7 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
     def test_retry_count_zero_makes_exactly_one_attempt(self) -> None:
         with patch("providers.openai_compatible.urlopen", side_effect=urllib.error.URLError("temporary")) as urlopen_mock:
             with self.assertRaises(ProviderError):
-                OpenAICompatibleProvider(self.profile).call(self.messages, profile_name="fast")
+                OpenAICompatibleProvider(self.profile).call(self.messages)
 
         self.assertEqual(1, urlopen_mock.call_count)
 
@@ -131,7 +130,6 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
         ) as urlopen_mock:
             response = OpenAICompatibleProvider(retrying_profile).call(
                 self.messages,
-                profile_name="fast",
             )
 
         self.assertEqual("ok", response.content)
@@ -152,7 +150,6 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
             with self.assertRaises(ProviderError) as error_context:
                 OpenAICompatibleProvider(retrying_profile).call(
                     self.messages,
-                    profile_name="fast",
                 )
 
         error_text = str(error_context.exception)
@@ -167,7 +164,6 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
         with patch("providers.openai_compatible.urlopen", return_value=FakeHttpResponse(response_payload)):
             response = OpenAICompatibleProvider(self.profile).call(
                 messages=[{"role": "user", "content": "abcde"}],
-                profile_name="fast",
             )
 
         self.assertEqual(2, response.usage.prompt_tokens)
@@ -191,7 +187,7 @@ class TestMockProvider(unittest.TestCase):
         )
 
         with patch("urllib.request.urlopen", side_effect=AssertionError("network called")):
-            response = provider.call([{"role": "user", "content": "ignored"}], "ignored")
+            response = provider.call([{"role": "user", "content": "ignored"}])
 
         self.assertIsInstance(response, LLMResponse)
         self.assertEqual("mock text", response.content)
@@ -204,12 +200,12 @@ class TestMockProvider(unittest.TestCase):
 
     def test_can_simulate_provider_error_timeout_and_invalid_json_content(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "mock provider_error"):
-            MockProvider(simulate="provider_error").call([], "mock")
+            MockProvider(simulate="provider_error").call([])
 
         with self.assertRaisesRegex(TimeoutError, "mock timeout"):
-            MockProvider(simulate="timeout").call([], "mock")
+            MockProvider(simulate="timeout").call([])
 
-        response = MockProvider(simulate="invalid_json").call([], "mock")
+        response = MockProvider(simulate="invalid_json").call([])
         self.assertEqual("{invalid json", response.content)
 
 

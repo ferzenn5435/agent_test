@@ -16,12 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class EchoProvider:
     """最小 fake provider：将第一条消息内容原样返回，用于验证 ModelProvider 协议。"""
 
-    def call(self, messages: list[dict[str, str]], profile_name: str) -> LLMResponse:
+    def call(self, messages: list[dict[str, str]]) -> LLMResponse:
         return LLMResponse(
             content=messages[0]["content"],
             provider="fake",
             model="fake-model",
-            profile_name=profile_name,
+            profile_name="fake-profile",
             latency_ms=12.5,
             usage=TokenUsage(
                 prompt_tokens=3,
@@ -108,13 +108,10 @@ class TestModelProviderProtocol(unittest.TestCase):
         provider = EchoProvider()
 
         self.assertIsInstance(provider, ModelProvider)
-        response = provider.call(
-            messages=[{"role": "user", "content": "ping"}],
-            profile_name="fast",
-        )
+        response = provider.call(messages=[{"role": "user", "content": "ping"}])
 
         self.assertEqual("ping", response.content)
-        self.assertEqual("fast", response.profile_name)
+        self.assertEqual("fake-profile", response.profile_name)
 
     def test_module_does_not_import_env_http_or_concrete_providers(self) -> None:
         with (REPO_ROOT / "model_provider.py").open(encoding="utf-8") as source_file:

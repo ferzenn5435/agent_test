@@ -1,4 +1,4 @@
-"""legacy run_eval profile 与 usage 字段单元测试。"""
+"""run_eval profile 与 usage 字段单元测试。"""
 
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ class FakeAgent:
         return self.answer_text
 
 
-class TestRunEvalLegacyCompatibility(unittest.TestCase):
-    """验证旧 run_eval CLI 兼容 profile 与 v0.7 字段。"""
+class TestRunEvalCurrentEntry(unittest.TestCase):
+    """验证 run_eval CLI 使用当前 profile 与 v0.7 字段。"""
 
     def setUp(self) -> None:
         FakeLlmClient.created_profiles = []
@@ -61,7 +61,6 @@ class TestRunEvalLegacyCompatibility(unittest.TestCase):
             "model_profile": "default",
             "provider": "mock",
             "model": "mock-model",
-            "llm_calls": 2,
             "usage_summary": {
                 "llm_call_count": 2,
                 "total_latency_ms": 12.5,

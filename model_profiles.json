@@ -1,9 +1,9 @@
 {
   "default": {
     "provider": "openai_compatible",
-    "base_url_env": "LLM_BASE_URL",
-    "api_key_env": "LLM_API_KEY",
-    "model_env": "LLM_MODEL",
+    "base_url_env": "DEFAULT_LLM_BASE_URL",
+    "api_key_env": "DEFAULT_LLM_API_KEY",
+    "model_env": "DEFAULT_LLM_MODEL",
     "temperature": 0.0,
     "max_output_tokens": 4096,
     "timeout_seconds": 60,

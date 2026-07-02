@@ -109,6 +109,8 @@ def run_model_eval(
     for profile in normalized_profiles:
         profile_error = _preflight_profile(profile)
         if profile_error is not None:
+            # profile 初始化失败属于配置级问题，同一 profile 的所有 case/trial 都会失败；
+            # 这里直接展开失败结果，避免反复构造客户端并淹没真正的 profile 错误。
             for trial_index in range(1, trials + 1):
                 for eval_case in cases:
                     trial_results.append(
@@ -255,6 +257,8 @@ def _run_single_trial(
         try:
             result_queue.put_nowait(trial_payload)
         except queue.Full:
+            # 主线程已经按 timeout 返回失败时，迟到的 worker 结果不再进入汇总，
+            # 否则同一个 trial 会出现“超时失败”和“实际结果”两条记录。
             pass
 
     worker_thread = threading.Thread(
@@ -327,6 +331,8 @@ def _run_single_trial_without_timeout(
     trial_payload["profile"] = profile
     trial_payload["trial_index"] = trial_index
     if not isinstance(trial_payload.get("model_profile"), str):
+        # 如果失败发生在 logger 写入模型字段之前，仍保留矩阵维度中的 profile，
+        # 便于 summary 按 profile 归组而不丢失来源。
         trial_payload["model_profile"] = profile
     return trial_payload
 
@@ -400,6 +406,7 @@ def _build_summary_rows(
             for trial_payload in profile_results
             if trial_payload.get("passed") is not True
         )
+        # summary 只做 profile 维度聚合；case/trial 细节保留在 results.json，避免表格过宽。
         rows.append(
             {
                 "profile": profile,

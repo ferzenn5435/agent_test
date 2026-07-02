@@ -65,23 +65,33 @@ class FakeLlmClient:
         plan_overhead = len(_default_plan_outputs()) if self.prepend_plan else 0
         return max(0, self._call_count - plan_overhead)
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
         if self._call_count >= len(self.outputs):
             raise AssertionError("fake LLM 没有更多输出")
         output = self.outputs[self._call_count]
         self._call_count += 1
         if callable(output):
-            return output(messages)
-        return output
+            content = output(messages)
+        else:
+            content = output
+        return LLMResponse(
+            content=content,
+            provider="mock",
+            model="fake-model",
+            profile_name="fake-profile",
+            latency_ms=0.0,
+            usage=TokenUsage(),
+            raw={},
+        )
 
 
 class StructuredFakeLlmClient(FakeLlmClient):
     """返回 LLMResponse 的 fake LLM，用于验证 usage schema。"""
 
     def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
-        content = self.chat(messages)
+        response = super().chat_response(messages)
         return LLMResponse(
-            content=content,
+            content=response.content,
             provider="mock",
             model="mock-model",
             profile_name="mock-profile",
@@ -1308,16 +1318,6 @@ class TestEvalRunnerV06LogChecks(unittest.TestCase):
 
         self.assertEqual([], errors)
 
-    def test_max_repair_attempts_accepts_legacy_singular_field(self) -> None:
-        case = self._case("legacy-repair", max_repair_attempts=1)
-        payload = self._payload()
-        payload.pop("repair_attempts")
-        payload["repair_attempt"] = 1
-
-        errors = eval_runner._check_run_log_constraints(case, payload)
-
-        self.assertEqual([], errors)
-
     def test_max_repair_attempts_reports_exceeded_limit(self) -> None:
         case = self._case("repair-exceeded", max_repair_attempts=0)
 
@@ -1694,19 +1694,23 @@ class TestRunEditEvalCli(unittest.TestCase):
         self.assertIn("edit eval 配置错误", stderr.getvalue())
         self.assertFalse(output_dir.exists())
 
-    def test_bundled_deterministic_factory_drives_subset_eval(self) -> None:
+    def test_current_fake_factory_drives_subset_eval(self) -> None:
         bundled_cases_path = self.project_root / "eval_cases" / "edit_cases.json"
         raw_cases = json.loads(bundled_cases_path.read_text(encoding="utf-8"))
         subset_cases = [case for case in raw_cases if case.get("id") == "update-readme"]
         cases_path = self.temp_root / "subset_edit_cases.json"
         cases_path.write_text(json.dumps(subset_cases, ensure_ascii=False), encoding="utf-8")
-        llm_client_factory = run_edit_eval_cli._bundled_eval_llm_factory(
-            bundled_cases_path.resolve(),
-            self.project_root.resolve(),
+        fake_llm = FakeLlmClient(
+            [
+                _tool_call("read_file", {"path": "README.md"}),
+                _readme_patch_call(),
+                _apply_last_patch_call,
+                _run_compile_tests_call(),
+                _tool_call("finish", {"answer": "README.md 已更新。"}),
+            ]
         )
 
-        self.assertIsNotNone(llm_client_factory)
-        summary = run_edit_eval(cases_path, self.project_root, llm_client_factory)
+        summary = run_edit_eval(cases_path, self.project_root, lambda _case: fake_llm)
 
         self.assertEqual(1, summary["total"])
         self.assertEqual(1, summary["passed"])
@@ -1715,7 +1719,7 @@ class TestRunEditEvalCli(unittest.TestCase):
         self.assertEqual("update-readme", results[0]["case_id"])
         self.assertEqual(("README.md",), tuple(results[0]["changed_files"]))
 
-    def test_main_uses_deterministic_factory_only_for_bundled_cases(self) -> None:
+    def test_main_uses_current_eval_runner_for_all_cases(self) -> None:
         bundled_cases_path = self.project_root / "eval_cases" / "context_cases.json"
         custom_cases_path = self.temp_root / "context_cases.json"
         custom_cases_path.write_text("[]", encoding="utf-8")
@@ -1754,11 +1758,10 @@ class TestRunEditEvalCli(unittest.TestCase):
             bundled_exit_code = run_edit_eval_cli.main()
 
         self.assertEqual(0, bundled_exit_code)
-        bundled_call_kwargs = bundled_run_eval_mock.call_args.kwargs
-        self.assertEqual(bundled_cases_path.resolve(), bundled_call_kwargs["cases_path"])
-        self.assertEqual(self.project_root.resolve(), bundled_call_kwargs["project_root"])
-        self.assertIn("llm_client_factory", bundled_call_kwargs)
-        self.assertIsNotNone(bundled_call_kwargs["llm_client_factory"])
+        bundled_run_eval_mock.assert_called_once_with(
+            cases_path=bundled_cases_path.resolve(),
+            project_root=self.project_root.resolve(),
+        )
 
         with patch.object(sys, "argv", custom_argv), patch.object(
             run_edit_eval_cli,
@@ -1808,9 +1811,6 @@ class TestReadmeV04Docs(unittest.TestCase):
             "带 marker 校验的临时代码库",
             "普通 CLI 仍然要求用户手动批准 `apply_patch`",
             "不要在日常使用中手动启用或创建 `auto_for_eval` 批准",
-            "仅限这些 bundled cases 的确定性 LLM fallback",
-            "仍会驱动真实 `CodeAnalysisAgent`、安全工具、补丁提案",
-            "自定义 eval 文件不会自动启用该 fallback",
         ]:
             with self.subTest(expected_text=expected_text):
                 self.assertIn(expected_text, self.readme_text)

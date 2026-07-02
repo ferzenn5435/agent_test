@@ -44,7 +44,7 @@ class RunState:
     context_stats: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
-        """校验对象创建时的阶段、历史与 repair_attempt 边界。"""
+        """校验对象创建时的阶段、历史与 repair_attempts 边界。"""
         if self.stage not in LEGAL_STAGES:
             raise RunStateError(f"非法 stage: {self.stage}")
         if not self.stage_history:

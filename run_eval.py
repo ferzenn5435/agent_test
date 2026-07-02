@@ -1,6 +1,6 @@
 """简单 agent 评估脚本。
 
-该脚本是 legacy 评测入口：
+该脚本是当前轻量评测入口：
 1. 加载 `eval_case.json`；
 2. 按 case 调用 agent；
 3. 校验 final_answer 是否包含 `must_contain`；
@@ -141,16 +141,16 @@ def build_result_payload(
     error: str | None = None,
     payload: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """构建 JSON-friendly 的 legacy eval 单条结果。
+    """构建 JSON-friendly 的 eval 单条结果。
 
-字段含义对应自动化采集逻辑：
-- passed / missing_keywords / error 用于判定；
+    字段含义对应自动化采集逻辑：
+    - passed / missing_keywords / error 用于判定；
 - model_profile / usage 字段用于 trace；
 - failure_type 统一走 classify_failure_type，便于与 edit eval 结果口径对齐。
     """
 
     reasons = _build_failure_reasons(missing_keywords, error)
-    metrics = _extract_legacy_metrics(payload, model_profile)
+    metrics = _extract_current_metrics(payload, model_profile)
     return {
         "case_index": case_index,
         "question": eval_case.question,
@@ -225,7 +225,7 @@ CLI 角色：
             )
             all_passed = False
             continue
-        except Exception as error:  # noqa: BLE001 - legacy eval 单 case 失败需归类并继续
+        except Exception as error:  # noqa: BLE001 - eval 单 case 失败需归类并继续
             print(f"result: fail")
             print(f"error: {error}")
             print(
@@ -286,13 +286,13 @@ def _build_failure_reasons(missing_keywords: list[str] | None, error: str | None
     return ()
 
 
-def _extract_legacy_metrics(
+def _extract_current_metrics(
     payload: Mapping[str, object] | None,
-    fallback_model_profile: str,
+    model_profile: str,
 ) -> dict[str, object]:
     if payload is None:
         return {
-            "model_profile": fallback_model_profile,
+            "model_profile": model_profile,
             "provider": None,
             "model": None,
             "llm_call_count": 0,
@@ -306,15 +306,11 @@ def _extract_legacy_metrics(
     if not isinstance(usage_summary, Mapping):
         usage_summary = {}
 
-    llm_call_count = _optional_int(usage_summary.get("llm_call_count"))
-    if llm_call_count is None:
-        llm_call_count = _optional_int(payload.get("llm_calls")) or 0
-
     return {
-        "model_profile": _optional_string(payload.get("model_profile")) or fallback_model_profile,
+        "model_profile": _optional_string(payload.get("model_profile")) or model_profile,
         "provider": _optional_string(payload.get("provider")),
         "model": _optional_string(payload.get("model")),
-        "llm_call_count": llm_call_count,
+        "llm_call_count": _optional_int(usage_summary.get("llm_call_count")) or 0,
         "total_latency_ms": _optional_float(usage_summary.get("total_latency_ms")) or 0.0,
         "total_tokens": _optional_int(usage_summary.get("total_tokens")) or 0,
         "estimated_tokens": _optional_int(usage_summary.get("estimated_tokens")) or 0,

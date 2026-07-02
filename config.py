@@ -44,20 +44,6 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class LlmConfig:
-    """LLM 连接配置。
-
-该结构主要兼容旧调用链：在某些测试/兼容路径中直接通过环境变量组装
-完整连接参数。
-    """
-
-    base_url: str
-    api_key: str
-    model: str
-    timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
-
-
-@dataclass(frozen=True)
 class ModelPricing:
     """模型价格配置。
 
@@ -121,38 +107,6 @@ def load_dotenv_file(env_file: Path = ENV_FILE) -> None:
             value = value[1:-1]
 
         os.environ.setdefault(name, value)
-
-
-def load_llm_config_from_env() -> LlmConfig:
-    """从环境变量读取旧版 LLM 连接配置。
-
-用于兼容没有 profile 的旧路径：读取 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`。
-当任一变量缺失时抛出 `ConfigError`。
-    """
-
-    load_dotenv_file()
-
-    base_url = os.environ.get("LLM_BASE_URL", "").strip()
-    api_key = os.environ.get("LLM_API_KEY", "").strip()
-    model = os.environ.get("LLM_MODEL", "").strip()
-
-    missing_names: list[str] = []
-    if not base_url:
-        missing_names.append("LLM_BASE_URL")
-    if not api_key:
-        missing_names.append("LLM_API_KEY")
-    if not model:
-        missing_names.append("LLM_MODEL")
-
-    if missing_names:
-        missing_text = ", ".join(missing_names)
-        raise ConfigError(f"缺少必要环境变量: {missing_text}")
-
-    return LlmConfig(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-    )
 
 
 def load_model_profile(

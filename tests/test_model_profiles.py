@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from config import ConfigError, load_llm_config_from_env, load_model_profile
+from config import ConfigError, load_model_profile
 
 
 class TestModelProfiles(unittest.TestCase):
@@ -19,11 +19,11 @@ class TestModelProfiles(unittest.TestCase):
         self.dotenv_patcher.start()
         self.addCleanup(self.dotenv_patcher.stop)
 
-    def test_default_profile_uses_legacy_llm_env_names(self) -> None:
+    def test_default_profile_uses_default_llm_env_names(self) -> None:
         env_values = {
-            "LLM_BASE_URL": "https://example.test/v1",
-            "LLM_API_KEY": "secret-default-key",
-            "LLM_MODEL": "default-model",
+            "DEFAULT_LLM_BASE_URL": "https://example.test/v1",
+            "DEFAULT_LLM_API_KEY": "secret-default-key",
+            "DEFAULT_LLM_MODEL": "default-model",
         }
 
         with patch.dict(os.environ, env_values, clear=True):
@@ -61,11 +61,11 @@ class TestModelProfiles(unittest.TestCase):
         self.assertEqual("secret-strong-key", strong_profile.api_key)
         self.assertEqual("strong-model", strong_profile.model)
 
-    def test_unknown_profile_fails_without_fallback(self) -> None:
+    def test_unknown_profile_reports_missing_profile(self) -> None:
         env_values = {
-            "LLM_BASE_URL": "https://example.test/v1",
-            "LLM_API_KEY": "secret-default-key",
-            "LLM_MODEL": "default-model",
+            "DEFAULT_LLM_BASE_URL": "https://example.test/v1",
+            "DEFAULT_LLM_API_KEY": "secret-default-key",
+            "DEFAULT_LLM_MODEL": "default-model",
         }
 
         with patch.dict(os.environ, env_values, clear=True):
@@ -74,8 +74,8 @@ class TestModelProfiles(unittest.TestCase):
 
     def test_missing_required_env_reports_names_without_secret_values(self) -> None:
         env_values = {
-            "LLM_BASE_URL": "https://example.test/v1",
-            "LLM_API_KEY": "secret-default-key",
+            "DEFAULT_LLM_BASE_URL": "https://example.test/v1",
+            "DEFAULT_LLM_API_KEY": "secret-default-key",
         }
 
         with patch.dict(os.environ, env_values, clear=True):
@@ -83,23 +83,9 @@ class TestModelProfiles(unittest.TestCase):
                 load_model_profile("default")
 
         error_text = str(error_context.exception)
-        self.assertIn("LLM_MODEL", error_text)
+        self.assertIn("DEFAULT_LLM_MODEL", error_text)
         self.assertNotIn("secret-default-key", error_text)
         self.assertNotIn("https://example.test/v1", error_text)
-
-    def test_load_llm_config_from_env_keeps_existing_behavior(self) -> None:
-        env_values = {
-            "LLM_BASE_URL": "https://example.test/v1",
-            "LLM_API_KEY": "secret-default-key",
-            "LLM_MODEL": "default-model",
-        }
-
-        with patch.dict(os.environ, env_values, clear=True):
-            llm_config = load_llm_config_from_env()
-
-        self.assertEqual("https://example.test/v1", llm_config.base_url)
-        self.assertEqual("secret-default-key", llm_config.api_key)
-        self.assertEqual("default-model", llm_config.model)
 
     def test_pricing_fields_are_loaded_when_present(self) -> None:
         profile_text = """

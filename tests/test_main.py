@@ -1,4 +1,4 @@
-"""命令行参数解析单元测试。"""
+﻿"""命令行参数解析单元测试。"""
 
 from __future__ import annotations
 
@@ -69,15 +69,25 @@ class FakeLlmClient:
         plan_overhead = len(_default_plan_outputs()) if self.prepend_plan else 0
         return max(0, self._call_count - plan_overhead)
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
         self.messages_by_call.append([dict(message) for message in messages])
         if self._call_count >= len(self.outputs):
             raise AssertionError("fake LLM 没有更多输出")
         output = self.outputs[self._call_count]
         self._call_count += 1
         if callable(output):
-            return output(messages)
-        return output
+            content = output(messages)
+        else:
+            content = output
+        return LLMResponse(
+            content=content,
+            provider="mock-provider",
+            model="fake-model",
+            profile_name="fake-profile",
+            latency_ms=0.0,
+            usage=TokenUsage(),
+            raw={},
+        )
 
 
 class FakeUsageLlmClient:
@@ -118,10 +128,6 @@ class FakeUsageLlmClient:
         self._call_count += 1
         return response
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
-        return self.chat_response(messages).content
-
-
 class FakeRunLogger:
     """记录 agent 写入 logger 的原始步骤。"""
 
@@ -131,7 +137,6 @@ class FakeRunLogger:
         self.error: str | None = None
         self.context_stats: dict[str, object] | None = None
         self.usage_summary: dict[str, object] | None = None
-        self.llm_calls: int | None = None
 
     def record_step(
         self,
@@ -169,10 +174,8 @@ class FakeRunLogger:
         provider: str | None,
         model: str | None,
         prompt_version: str | None,
-        llm_calls: int,
         usage_summary: dict[str, object],
     ) -> None:
-        self.llm_calls = llm_calls
         self.usage_summary = dict(usage_summary)
 
 
@@ -440,13 +443,11 @@ class TestPatchCliCommands(unittest.TestCase):
         stderr_buffer = io.StringIO()
         with patch("sys.argv", argv):
             with patch("main.CodeAnalysisAgent") as mocked_agent:
-                with patch("main.load_llm_config_from_env") as mocked_load_config:
-                    with patch("main.LlmClient") as mocked_llm_client:
-                        with patch("builtins.input") as mocked_input:
-                            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                                exit_code = main()
+                with patch("main.LlmClient") as mocked_llm_client:
+                    with patch("builtins.input") as mocked_input:
+                        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                            exit_code = main()
         mocked_agent.assert_not_called()
-        mocked_load_config.assert_not_called()
         mocked_llm_client.assert_not_called()
         mocked_input.assert_not_called()
         return exit_code, stdout_buffer.getvalue(), stderr_buffer.getvalue()
@@ -914,15 +915,14 @@ class TestMainApplyApproval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             with patch("sys.argv", ["main.py", "--repo", str(repo_path), "question"]):
-                with patch("main.load_llm_config_from_env", return_value=object()):
-                    with patch("main.LlmClient", return_value=cast(LlmClient, object())):
-                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
-                            mocked_agent = mocked_agent_class.return_value
-                            mocked_agent.answer.return_value = "done"
-                            with patch("builtins.input") as mocked_input:
-                                stdout_buffer = io.StringIO()
-                                with redirect_stdout(stdout_buffer):
-                                    exit_code = main()
+                with patch("main.LlmClient", return_value=cast(LlmClient, object())):
+                    with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                        mocked_agent = mocked_agent_class.return_value
+                        mocked_agent.answer.return_value = "done"
+                        with patch("builtins.input") as mocked_input:
+                            stdout_buffer = io.StringIO()
+                            with redirect_stdout(stdout_buffer):
+                                exit_code = main()
 
         self.assertEqual(0, exit_code)
         mocked_input.assert_not_called()
@@ -937,15 +937,13 @@ class TestMainApplyApproval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             with patch("sys.argv", ["main.py", "--repo", str(repo_path), "question"]):
-                with patch("main.load_llm_config_from_env") as mocked_load_config:
-                    with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
-                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
-                            mocked_agent_class.return_value.answer.return_value = "done"
-                            with redirect_stdout(io.StringIO()):
-                                exit_code = main()
+                with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
+                    with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                        mocked_agent_class.return_value.answer.return_value = "done"
+                        with redirect_stdout(io.StringIO()):
+                            exit_code = main()
 
         self.assertEqual(0, exit_code)
-        mocked_load_config.assert_not_called()
         mocked_llm_client.assert_called_once_with(model_profile="default")
 
     def test_ordinary_cli_passes_explicit_model_profile_to_llm_client(self) -> None:
@@ -953,34 +951,30 @@ class TestMainApplyApproval(unittest.TestCase):
             repo_path = Path(temp_dir)
             argv = ["main.py", "--repo", str(repo_path), "--model-profile", "fast", "question"]
             with patch("sys.argv", argv):
-                with patch("main.load_llm_config_from_env") as mocked_load_config:
-                    with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
-                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
-                            mocked_agent_class.return_value.answer.return_value = "done"
-                            with redirect_stdout(io.StringIO()):
-                                exit_code = main()
+                with patch("main.LlmClient", return_value=cast(LlmClient, object())) as mocked_llm_client:
+                    with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                        mocked_agent_class.return_value.answer.return_value = "done"
+                        with redirect_stdout(io.StringIO()):
+                            exit_code = main()
 
         self.assertEqual(0, exit_code)
-        mocked_load_config.assert_not_called()
         mocked_llm_client.assert_called_once_with(model_profile="fast")
 
-    def test_unknown_model_profile_returns_nonzero_without_fallback(self) -> None:
+    def test_unknown_model_profile_returns_nonzero_without_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             stderr_buffer = io.StringIO()
             argv = ["main.py", "--repo", str(repo_path), "--model-profile", "missing", "question"]
             with patch("sys.argv", argv):
-                with patch("main.load_llm_config_from_env") as mocked_load_config:
-                    with patch(
-                        "main.LlmClient",
-                        side_effect=LlmClientError("Unknown model profile: missing"),
-                    ) as mocked_llm_client:
-                        with patch("main.CodeAnalysisAgent") as mocked_agent_class:
-                            with redirect_stderr(stderr_buffer):
-                                exit_code = main()
+                with patch(
+                    "main.LlmClient",
+                    side_effect=LlmClientError("Unknown model profile: missing"),
+                ) as mocked_llm_client:
+                    with patch("main.CodeAnalysisAgent") as mocked_agent_class:
+                        with redirect_stderr(stderr_buffer):
+                            exit_code = main()
 
         self.assertNotEqual(0, exit_code)
-        mocked_load_config.assert_not_called()
         mocked_llm_client.assert_called_once_with(model_profile="missing")
         mocked_agent_class.assert_not_called()
         self.assertIn("Unknown model profile: missing", stderr_buffer.getvalue())
@@ -1086,7 +1080,7 @@ class TestReadmeV03Docs(unittest.TestCase):
         self.assertIn("不使用 LangChain、LangGraph、LlamaIndex、MCP 或多 agent 框架", self.readme_text)
         self.assertIn("不会在没有人工批准的情况下应用修改", self.readme_text)
 
-    def test_eval_case_does_not_depend_on_legacy_patch_contract(self) -> None:
+    def test_eval_case_uses_current_patch_contract(self) -> None:
         self.assertNotIn("propose_patch(file_path", self.eval_text)
         self.assertNotIn("replacements", self.eval_text)
         self.assertNotIn("五", self.eval_text)
@@ -1525,7 +1519,6 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertEqual("step-1", steps[0]["plan_step_id"])
             verify_status = cast(dict[str, object], run_logger.payload["verify_status"])
             self.assertTrue(verify_status["passed"])
-            self.assertEqual(0, run_logger.payload["repair_attempt"])
             self.assertEqual(0, run_logger.payload["repair_attempts"])
 
     def test_payload_records_run_and_step_usage_from_structured_llm_response(self) -> None:
@@ -1568,7 +1561,6 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertEqual("mock-provider", run_logger.payload["provider"])
             self.assertEqual("usage-model", run_logger.payload["model"])
             self.assertEqual("v0.6", run_logger.payload["prompt_version"])
-            self.assertEqual(3, run_logger.payload["llm_calls"])
             usage_summary = cast(dict[str, object], run_logger.payload["usage_summary"])
             self.assertEqual(3, usage_summary["llm_call_count"])
             self.assertEqual(60.0, usage_summary["total_latency_ms"])
@@ -1597,7 +1589,6 @@ class TestAgentContextV05(unittest.TestCase):
                     "provider": run_logger.payload["provider"],
                     "model": run_logger.payload["model"],
                     "prompt_version": run_logger.payload["prompt_version"],
-                    "llm_calls": run_logger.payload["llm_calls"],
                     "usage_summary": run_logger.payload["usage_summary"],
                     "steps_usage": [
                         {
@@ -1612,11 +1603,11 @@ class TestAgentContextV05(unittest.TestCase):
             self.assertNotIn("Authorization", metadata_text)
             self.assertNotIn(secret_value, metadata_text)
 
-    def test_legacy_chat_fake_keeps_running_with_safe_usage_defaults(self) -> None:
+    def test_structured_fake_records_safe_usage_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             fake_llm = FakeLlmClient([_agent_tool_call("finish", {"answer": "完成"})])
-            run_logger = RunLogger(repo_path=repo_path, user_task="legacy", log_dir=repo_path / "logs")
+            run_logger = RunLogger(repo_path=repo_path, user_task="structured", log_dir=repo_path / "logs")
             agent = CodeAnalysisAgent(
                 llm_client=cast(LlmClient, fake_llm),
                 repository_tools=RepositoryTools(repo_path),
@@ -1627,12 +1618,11 @@ class TestAgentContextV05(unittest.TestCase):
             final_answer = agent.answer("直接完成")
 
             _assert_v06_summary(self, final_answer, "完成")
-            self.assertEqual(2, run_logger.payload["llm_calls"])
             usage_summary = cast(dict[str, object], run_logger.payload["usage_summary"])
-            self.assertEqual(0, usage_summary["llm_call_count"])
+            self.assertEqual(2, usage_summary["llm_call_count"])
             steps = cast(list[dict[str, object]], run_logger.payload["steps"])
-            self.assertIsNone(steps[0]["latency_ms"])
-            self.assertIsNone(steps[0]["usage"])
+            self.assertEqual(0.0, steps[0]["latency_ms"])
+            self.assertIsInstance(steps[0]["usage"], dict)
 
     def test_tests_failed_verification_triggers_one_repair_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1681,7 +1671,6 @@ class TestAgentContextV05(unittest.TestCase):
             _assert_v06_summary(self, final_answer, "修复后完成")
             self.assertEqual(2, run_tests_calls)
             self.assertEqual(1, run_logger.payload["repair_attempts"])
-            self.assertEqual(1, run_logger.payload["repair_attempt"])
             self.assertEqual(
                 ["INIT", "PLAN", "EXECUTE", "VERIFY", "REPAIR", "EXECUTE", "VERIFY", "FINISH"],
                 run_logger.payload["stage_history"],
@@ -1801,14 +1790,14 @@ class TestPromptContextV05(unittest.TestCase):
 
 
 class TestRunLoggerV06Protocol(unittest.TestCase):
-    """验证 logger payload 的 v0.6 默认字段与旧字段兼容。"""
+    """验证 logger payload 的 v0.6 当前默认字段。"""
 
-    def test_payload_keeps_legacy_fields_and_adds_v06_defaults(self) -> None:
+    def test_payload_records_current_v06_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_path = Path(temp_dir)
             run_logger = RunLogger(repo_path=repo_path, user_task="检查日志", log_dir=repo_path / "logs")
 
-            for legacy_field in [
+            for current_field in [
                 "started_at",
                 "repo_path",
                 "user_task",
@@ -1817,21 +1806,19 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
                 "error",
                 "context_stats",
             ]:
-                with self.subTest(legacy_field=legacy_field):
-                    self.assertIn(legacy_field, run_logger.payload)
+                with self.subTest(current_field=current_field):
+                    self.assertIn(current_field, run_logger.payload)
 
             self.assertEqual("INIT", run_logger.payload["stage"])
             self.assertEqual(["INIT"], run_logger.payload["stage_history"])
             self.assertIsNone(run_logger.payload["plan"])
             self.assertIsNone(run_logger.payload["plan_step_id"])
-            self.assertEqual(0, run_logger.payload["repair_attempt"])
             self.assertEqual(0, run_logger.payload["repair_attempts"])
             self.assertIsNone(run_logger.payload["verify_status"])
             self.assertIsNone(run_logger.payload["model_profile"])
             self.assertIsNone(run_logger.payload["provider"])
             self.assertIsNone(run_logger.payload["model"])
             self.assertEqual("v0.6", run_logger.payload["prompt_version"])
-            self.assertEqual(0, run_logger.payload["llm_calls"])
             self.assertEqual(
                 {
                     "llm_call_count": 0,
@@ -1910,7 +1897,6 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
                 provider="mock-provider",
                 model="mock-model",
                 prompt_version="v0.6",
-                llm_calls=2,
                 usage_summary=usage_summary,
             )
 
@@ -1918,7 +1904,6 @@ class TestRunLoggerV06Protocol(unittest.TestCase):
             self.assertEqual("mock-provider", run_logger.payload["provider"])
             self.assertEqual("mock-model", run_logger.payload["model"])
             self.assertEqual("v0.6", run_logger.payload["prompt_version"])
-            self.assertEqual(2, run_logger.payload["llm_calls"])
             self.assertEqual(usage_summary, run_logger.payload["usage_summary"])
 
 

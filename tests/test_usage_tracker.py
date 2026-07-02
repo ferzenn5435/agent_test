@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DuckPricing:
-    """鸭子类型 pricing 对象，用于验证 normalizer 接受非 ModelPricing 的 compatible 对象。"""
+    """鸭子类型 pricing 对象，用于验证 normalizer 接受相同字段对象。"""
 
     input_per_1m_tokens = 1.0
     output_per_1m_tokens = 2.0

@@ -841,8 +841,8 @@ class TestProposePatchV03(unittest.TestCase):
 
         self.assertEqual(patch_dir / "patch.diff", patch_path)
         self.assertEqual(diff_text, patch_path.read_text(encoding="utf-8"))
-        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_result['patch_id']}.patch").exists())
-        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_result['patch_id']}.json").exists())
+        self.assertTrue((patch_dir / "patch.diff").is_file())
+        self.assertTrue(metadata_path.is_file())
         self.assertEqual("pending_approval", metadata["status"])
         self.assertEqual(instruction, metadata["instruction"])
         self.assertEqual("", metadata["run_id"])
@@ -944,7 +944,6 @@ class TestProposePatchV03(unittest.TestCase):
 
     def test_propose_patch_v03_rejects_invalid_diff_without_writing(self) -> None:
         patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
-        existing_patch_files = list(patch_dir.glob("*.patch"))
         existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
 
         patch_result = self.repository_tools.propose_patch(
@@ -954,14 +953,11 @@ class TestProposePatchV03(unittest.TestCase):
 
         self.assertFalse(patch_result["ok"])
         self.assertTrue(patch_result["errors"])
-        self.assertEqual(existing_patch_files, list(patch_dir.glob("*.patch")))
         self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
 
     def test_propose_patch_v03_rejects_hunk_body_count_mismatch_without_writing(self) -> None:
         self.temp_repo_helper.create_text_file("count_mismatch.txt", "one\ntwo\nthree\n")
         patch_dir = self.temp_repo_helper.repo_root / ".repopilot/patches"
-        existing_patch_files = list(patch_dir.glob("*.patch"))
-        existing_metadata_files = list(patch_dir.glob("*.json"))
         existing_patch_dirs = [path for path in patch_dir.iterdir() if path.is_dir()]
         diff_text = (
             "diff --git a/count_mismatch.txt b/count_mismatch.txt\n"
@@ -991,8 +987,6 @@ class TestProposePatchV03(unittest.TestCase):
                 for error in errors_object
             )
         )
-        self.assertEqual(existing_patch_files, list(patch_dir.glob("*.patch")))
-        self.assertEqual(existing_metadata_files, list(patch_dir.glob("*.json")))
         self.assertEqual(existing_patch_dirs, [path for path in patch_dir.iterdir() if path.is_dir()])
         self.assertEqual("one\ntwo\nthree\n", self.temp_repo_helper.read_text_file("count_mismatch.txt"))
 
@@ -1533,8 +1527,8 @@ class TestRepositoryToolsV03Storage(unittest.TestCase):
         self.assertEqual(patch_path.parent.name, patch_id)
         self.assertEqual(metadata_path.name, "metadata.json")
         self.assertEqual(metadata_path.parent.name, patch_id)
-        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.patch").exists())
-        self.assertFalse((self.temp_repo_helper.repo_root / ".repopilot/patches" / f"{patch_id}.json").exists())
+        self.assertTrue((self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "patch.diff").is_file())
+        self.assertTrue((self.temp_repo_helper.repo_root / ".repopilot/patches" / patch_id / "metadata.json").is_file())
         self.assertEqual(patch_text, self.repository_tools._read_patch_file(patch_id))
         self.assertEqual(metadata, self.repository_tools._read_patch_metadata(patch_id))
         self.assertEqual(patch_id, metadata["patch_id"])

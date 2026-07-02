@@ -14,9 +14,9 @@ from dataclasses import dataclass, replace
 
 from config import MAX_STEPS
 from context_stats import ContextStats
-from llm_client import LlmClient
+from llm_client import LlmClient, LlmClientError
 from logger import RunLogger
-from model_provider import TokenUsage
+from model_provider import LLMResponse, TokenUsage
 import planner
 from prompts import build_system_prompt
 from run_state import RunState
@@ -46,19 +46,28 @@ class _LlmCallResult:
 
 
 class _UsageTrackingLlmProxy:
-    """给 planner 使用的 chat-only 适配器。
+    """给 planner 使用的结构化 LLM 调用代理。
 
-Planner 只调用 chat 方法，不关心 usage。真实统计仍由 CodeAnalysisAgent
-统一在 _call_llm 中更新。
+    Planner 只读取 LLMResponse.content。真实统计仍由 CodeAnalysisAgent
+    统一在 _call_llm 中更新。
 """
 
     def __init__(self, agent: CodeAnalysisAgent) -> None:
         """注入主 Agent，作为 chat 返回值的统一来源。"""
         self.agent = agent
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
-        """调用主 agent 的 LLM 接口并返回文本响应。"""
-        return self.agent._call_llm(messages).content
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
+        """调用主 agent 的 LLM 接口并返回结构化响应。"""
+        call_result = self.agent._call_llm(messages)
+        return LLMResponse(
+            content=call_result.content,
+            provider=call_result.provider or "unknown",
+            model=call_result.model or "unknown",
+            profile_name=call_result.profile_name or "unknown",
+            latency_ms=call_result.latency_ms or 0.0,
+            usage=TokenUsage(),
+            raw={},
+        )
 
 
 class AgentStepError(ValueError):
@@ -369,44 +378,32 @@ deterministic 校验与最终汇总。
     def _call_llm(self, messages: list[dict[str, str]]) -> _LlmCallResult:
         """执行一次 LLM 调用并生成统一的调用快照。
 
-兼容 chat_response 与 legacy chat 两种实现，均返回含 content 的标准
-结构并统计 latency/usage/provider/model。
+        当前 LLM API 返回 LLMResponse，调用方统一读取 content 并记录
+        latency/usage/provider/model。
 """
-        chat_response = getattr(self.llm_client, "chat_response", None)
-        if callable(chat_response):
-            response = chat_response(messages)
-            content = str(getattr(response, "content"))
-            latency_ms = self._optional_float(getattr(response, "latency_ms", None))
-            usage_value = getattr(response, "usage", None)
-            usage_dict = self._usage_to_dict(usage_value)
-            provider = self._optional_text(getattr(response, "provider", None))
-            model = self._optional_text(getattr(response, "model", None))
-            profile_name = self._optional_text(getattr(response, "profile_name", None))
-            self._record_llm_call(
-                latency_ms=latency_ms,
-                usage_value=usage_value,
-                provider=provider,
-                model=model,
-                profile_name=profile_name,
-            )
-            return _LlmCallResult(
-                content=content,
-                latency_ms=latency_ms,
-                usage=usage_dict,
-                provider=provider,
-                model=model,
-                profile_name=profile_name,
-            )
-
-        legacy_content = self.llm_client.chat(messages)
+        response = self.llm_client.chat_response(messages)
+        content = response.content
+        latency_ms = self._optional_float(response.latency_ms)
+        usage_value = response.usage
+        usage_dict = self._usage_to_dict(usage_value)
+        provider = self._optional_text(response.provider)
+        model = self._optional_text(response.model)
+        profile_name = self._optional_text(response.profile_name)
         self._record_llm_call(
-            latency_ms=None,
-            usage_value=None,
-            provider=None,
-            model=None,
-            profile_name=None,
+            latency_ms=latency_ms,
+            usage_value=usage_value,
+            provider=provider,
+            model=model,
+            profile_name=profile_name,
         )
-        return _LlmCallResult(content=legacy_content)
+        return _LlmCallResult(
+            content=content,
+            latency_ms=latency_ms,
+            usage=usage_dict,
+            provider=provider,
+            model=model,
+            profile_name=profile_name,
+        )
 
     def _record_llm_call(
         self,
@@ -441,7 +438,6 @@ deterministic 校验与最终汇总。
                 provider=self._provider,
                 model=self._model,
                 prompt_version=PROMPT_VERSION,
-                llm_calls=self._llm_call_count,
                 usage_summary=usage_summary,
             )
             return
@@ -452,7 +448,6 @@ deterministic 校验与最终汇总。
             payload["provider"] = self._provider
             payload["model"] = self._model
             payload["prompt_version"] = PROMPT_VERSION
-            payload["llm_calls"] = self._llm_call_count
             payload["usage_summary"] = usage_summary
             save = getattr(self.run_logger, "save", None)
             if callable(save):
@@ -892,7 +887,6 @@ deterministic 校验与最终汇总。
         payload["verify_status"] = (
             verify_status.to_dict() if verify_status is not None else None
         )
-        payload["repair_attempt"] = state_dict["repair_attempts"]
         payload["repair_attempts"] = state_dict["repair_attempts"]
         save = getattr(self.run_logger, "save", None)
         if callable(save):

@@ -57,7 +57,6 @@ class RunLogger:
             "stage_history": ["INIT"],
             "plan": None,
             "plan_step_id": None,
-            "repair_attempt": 0,
             "repair_attempts": 0,
             "verify_status": None,
             "steps": [],
@@ -68,7 +67,6 @@ class RunLogger:
             "provider": None,
             "model": None,
             "prompt_version": DEFAULT_PROMPT_VERSION,
-            "llm_calls": 0,
             "usage_summary": dict(DEFAULT_USAGE_SUMMARY),
         }
         self.save()
@@ -136,7 +134,6 @@ class RunLogger:
         provider: str | None,
         model: str | None,
         prompt_version: str | None,
-        llm_calls: int,
         usage_summary: dict[str, object],
     ) -> None:
         """记录 agent 提供的 LLM usage 汇总。
@@ -149,7 +146,6 @@ class RunLogger:
         self.payload["provider"] = provider
         self.payload["model"] = model
         self.payload["prompt_version"] = prompt_version
-        self.payload["llm_calls"] = llm_calls
         self.payload["usage_summary"] = dict(usage_summary)
         self.save()
 

@@ -12,6 +12,7 @@ import json
 from collections.abc import Sequence
 from typing import Protocol
 
+from model_provider import LLMResponse
 from schemas import (
     LEGAL_RISK_LEVELS,
     LEGAL_TASK_TYPES,
@@ -26,12 +27,12 @@ from schemas import (
 class LlmClientProtocol(Protocol):
     """约定外部 LLM 客户端的最小接口。
 
-`Planner` 不依赖具体厂商实现，只要求 `chat(messages)` 返回纯文本即可；
-后续是否是 JSON、是否满足字段约束，由本文件自身完成，不可把“模型能力”当作
-信任边界。
+    `Planner` 不依赖具体厂商实现，只要求 `chat_response(messages)` 返回
+    结构化 LLMResponse；后续 content 是否是 JSON、是否满足字段约束，
+    由本文件自身完成，不可把“模型能力”当作信任边界。
     """
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    def chat_response(self, messages: list[dict[str, str]]) -> LLMResponse:
         ...
 
 
@@ -333,9 +334,9 @@ def create_plan(
     ]
 
     try:
-        raw_output = llm_client.chat(messages)
+        response = llm_client.chat_response(messages)
     except Exception as error:
         raise PlannerError(f"LLM call failed: {error}") from error
 
-    parsed = _validate_llm_output(raw_output)
+    parsed = _validate_llm_output(response.content)
     return _build_task_plan_from_dict(parsed, max_steps)
